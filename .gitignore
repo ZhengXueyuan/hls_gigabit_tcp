@@ -1,0 +1,26 @@
+# HLS build artifacts
+*_prj/
+solution1/
+*.log
+logs/
+
+# Vivado build artifacts
+vivado_prj/
+uo_prj/
+qt_prj/
+test_prj/
+*.jou
+*.str
+
+# Temporary files
+*.exe
+*.o
+tmp_*
+*.output
+
+# Editor files
+*.swp
+*~
+
+# UART test artifacts
+uart_hls/uart_prj/
