@@ -1,0 +1,5 @@
+- [AMD Tools 2025.2 — Paths and Invocation](amd-tools-2025-2-paths-and-invocation.md) — Vivado/Vitis HLS 安装路径、环境设置、正确调用方式
+- [HLS Common Mistakes and Pitfalls](hls-common-mistakes-and-pitfalls.md) — HLS 开发常见错误与经验教训
+- [FPGA Board Programming](fpga-board-programming.md) — FPGA 开发板检测、编程脚本、常见错误
+- [stream_light Project Context](stream-light-project-context.md) — 流水灯工程的设计规格与 HLS 迁移记录
+- [udp_hls Project Context](udp-hls-project-context.md) — HLS 网络协议栈架构、构建、板级信息
