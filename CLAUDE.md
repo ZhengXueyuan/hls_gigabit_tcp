@@ -75,8 +75,9 @@ config_rtl -reset all -reset_async -reset_level low
 2. **`uint8_t` 索引截断**: 地址 ≥256 时需用 `uint16_t`
 3. **跨周期变量**: 用 `static` 保存，不依赖 `rx.xxx = 0` (每周期清零)
 4. **`fpga_gclk` 未用**: 声明但不连接会导致 DONE=LOW，需移除端口
-5. **DONE=LOW 调试**: 先分别测各 IP 能否独立烧录, 定位问题 IP
+5. **DONE=LOW 调试**: 先分别测各 IP 能否独立烧录, 定位问题 IP; 若均失败 → JTAG 降频 1MHz 重试
 6. **UART 同频**: 当前 UART 与网络共用 e_rxc (125MHz)，波特率分频=13020
+7. **JTAG 降频**: 板级烧录 DONE=LOW 时用 `set_property PARAM.FREQUENCY 1000000 $target` (默认高频不稳)
 
 ### 板级信息
 
