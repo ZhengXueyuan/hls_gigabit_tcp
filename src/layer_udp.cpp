@@ -115,7 +115,7 @@ static void udp_tx_process(
         if (has_data) has_data = false;
 
         // Determine destination IP and look up MAC
-        uint32_t dst_ip = 0xC0A80003;  // 192.168.0.3 (default dest)
+        uint32_t dst_ip = 0xC0A86401;  // 192.168.100.1 (PC, default dest)
         mac_addr_t dst_mac = 0xFFFFFFFFFFFFULL;   // default: broadcast
         bool use_unicast = false;
 

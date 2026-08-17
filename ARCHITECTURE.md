@@ -1,49 +1,49 @@
 # udp_echo HLS — 协议架构设计与工程文档
 
+> **2026-08-18 移植状态**: 本目录是 ECO 板 (Kintex-7 XC7K325T) 的移植副本, 原始工程
+> (Artix-7 Perf-V) 在 D:\repo\perfv\udp_hls。协议栈源码架构不变, 本节及以下各节描述
+> HLS 协议栈本身; 移植后的板卡/wrapper/调试结论见 MIGRATION_K7325T.md 与 PORT_NOTES.md。
+
 ## 1. 项目概述
 
 本项目将原始的 Verilog GMII 千兆以太网 UDP echo demo (`udp/`) 用 AMD Vitis HLS 2025.2 重写，
 目标是构建一个可逐步扩展至完整 IP 协议栈的 FPGA 网络处理架构。
 
-- **目标器件**: xc7a35tftg256-1 (Artix-7)
-- **主时钟**: 125 MHz (GMII RX clock, 8 ns)
-- **物理接口**: GMII (8-bit @ 125MHz)
+- **移植目标器件**: xc7k325tffg676-2 (Kintex-7 325T, ECO 板; 原工程 xc7a35tftg256-1)
+- **主时钟**: 125 MHz (RGMII RX clock 8 ns, 经 BUFG 反相 → gmii_clk)
+- **物理接口**: RGMII 4bit DDR (RTL8211E-VL, 1.8V IO) — wrapper 内 k720 demo 转换器转 GMII
 - **HLS 顶层接口**: AXI-Stream (`#pragma HLS INTERFACE axis`)
 - **复位**: 异步低有效 (`config_rtl -reset all -reset_async -reset_level low`)
 
 ---
 
-## 2. 项目文件结构
+## 2. 项目文件结构 (ECO 移植版)
 
 ```
-udp_hls/
-├── src/
-│   ├── eth_types.h      # 协议类型定义 (所有层间接口 struct, VLAN 常量, gmii_byte_t)
-│   ├── eth_utils.h      # 通用函数 (CRC32, IP checksum, 字节序转换)
-│   ├── layer_mac.cpp    # Layer 1 — MAC 层 (AXI-Stream + VLAN tag + CRC)
-│   ├── layer_arp.cpp    # Layer 2 — ARP (16 条目 BRAM, Request→Reply)
-│   ├── layer_ip.cpp     # Layer 2 — IP (RX checksum 校验, protocol 分发)
-│   ├── layer_icmp.cpp   # Layer 2 — ICMP Echo Reply (ping)
-│   ├── layer_igmp.cpp   # Layer 2 — IGMPv1/v2 Membership Report
-│   ├── layer_dhcp.cpp   # Layer 3 — DHCP Client (DORA sequence)
-│   ├── layer_udp.cpp    # Layer 3 — UDP 传输层 (端口过滤, echo)
-│   └── udp_echo.cpp     # 顶层 HLS 函数 (stream 接口, 连接所有层)
-├── tb/
-│   ├── layer_stats.cpp  # 统计计数器 + ARP dump
-│   └── udp_echo_tb.cpp  # C 仿真测试 (13 项测试)
-├── uart_hls/              # 独立 UART IP 工程 (@50MHz)
-│   ├── src/uart_console.cpp
-│   ├── tb/uart_tb.cpp
-│   └── run_hls.tcl
-├── ARCHITECTURE.md       # 本文档
-├── run_hls.bat           # HLS 综合批处理
-├── run_hls.tcl           # HLS Tcl 脚本
-├── run_vivado_wrapper.tcl # Vivado 实现脚本
-├── wrapper.v             # GMII ↔ AXI-Stream 适配器 (1-cycle RX delay for last flag)
-├── udp_echo_prj/         # HLS 工程输出
-│   └── solution1/syn/verilog/  # HLS 生成的 RTL
-└── vivado_prj/           # Vivado 工程输出
-    └── udp_echo_wrapper.runs/impl_1/wrapper.bit
+udp_hls_eco/
+├── src/                  # 协议栈 HLS 源码 (同原工程, 仅 eth_types.h 改 BOARD_IP + 4 个 bug 修复)
+│   ├── eth_types.h       #   协议类型 + BOARD_IP 192.168.100.2 / MAC 00:0A:35:01:FE:C0
+│   ├── eth_utils.h       #   CRC32, IP checksum, 字节序转换
+│   ├── layer_mac.cpp     #   MAC 层 (AXI-Stream + VLAN tag + CRC + <46B padding)
+│   ├── layer_arp.cpp     #   ARP (L1:8 LRU + L2:256 BRAM)
+│   ├── layer_ip.cpp      #   IP (RX checksum 校验, protocol 分发)
+│   ├── layer_icmp.cpp    #   ICMP Echo Reply (ping)
+│   ├── layer_igmp.cpp    #   IGMPv1/v2 Membership Report
+│   ├── layer_dhcp.cpp    #   DHCP Client (DORA, 完整 IPv4 头 + 防洪泛)
+│   ├── layer_udp.cpp     #   UDP (8080 echo, ARP lookup)
+│   └── udp_echo.cpp      #   顶层 HLS 函数 (stream 接口, 连接所有层)
+├── tb/                   # C 仿真测试 (14 项, 2026-08-18 全过)
+├── uart_hls/             # 独立 UART IP 工程 (@50MHz, Latency 0 / Interval 1)
+├── wrapper_1g.v          # 主顶层: MMCM 200M + k720 RGMII + RX/TX FIFO 帧桥 + 探针
+├── wrapper_min*.v        # 最小实验变体 (bisect 调试用)
+├── net_stats.v           # UART 统计探针 (?net ?txd ?rxd ?raw)
+├── util_gmii_to_rgmii.v  # k720 demo RGMII 转换器 (原版逐字)
+├── xdc/eco_rgmii_phy1.xdc
+├── run_hls.bat / run_hls.tcl
+├── run_vivado_phy1g2.bat / .tcl   # 主 Vivado 构建 (wrapper_1g)
+├── program_eco.tcl       # 烧录 (JTAG 1MHz)
+├── MIGRATION_K7325T.md   # 移植指南 (硬件结论 + 操作步骤)
+└── PORT_NOTES.md         # 完整施工日志
 ```
 
 **编译方式**: 所有 `.cpp` 文件通过 `#include` 纳入 `udp_echo.cpp`。
@@ -293,6 +293,20 @@ Buffer + ARP 表均通过 `#pragma HLS RESOURCE core=RAM_2P_BRAM` 推断为双�
 | ARP lookup 目标 IP 错误 | ARP 查询错误 IP | `(192UL<<24)\|...\|3UL` 编译行为与预期不同 | 改为显式 hex `0xC0A80003` |
 | UDP TX 签名变更缺失 | 编译错误 | Phase 3 改用 stream 后 `arp_table` 参数未传递 | 加入 `arp_table` 参数 |
 
+### ECO 板移植期修复 (2026-08-18, 板级/仿真驱动)
+
+| Bug | 现象 | 根因 | 修复 |
+|-----|------|------|------|
+| ARP 帧 runt | PC 网卡硬件静默丢弃 (pktmon 不可见) | 46B ARP 帧 < 64B 最小帧 | MAC_TX_SENDDATA 补零到 46B, pad 进 CRC |
+| DHCP 帧缺 IP 头 + 缓冲越界 | DHCP 无法完成 DORA | DHCP 帧布局未含 IPv4 头, 写入越界 | 新布局 DHCP_FRAME_BASE=word 288, 82 words; 完整 IPv4 头 (0x45 00, csum 0x39A6) |
+| DHCP 无限洪泛 | ~134ms/次重发刷屏 | 失败路径无退避, retry 立即重来 | DHCP_FAILED(6) 状态 + retry_cnt 复位 |
+| wrapper rx_last_in 极性反 | IP 永不 complete 帧 | dv 上升沿被误当帧尾 | `rx_dv_d2 && !rx_dv_d1` (下降沿) 并 push rx_d2 |
+| demo 克隆生成器 FCS 位序错 | **所有 demo 克隆实验的帧被网卡当 FCS 错静默丢弃** | eth_crc32 用 unreflected MSB-first CRC → 线上 FCS 位反转 (21 27 d6 68 vs 正确 63 f9 a3 ca) | 标准 reflected CRC-32 (0xEDB88320), 终值取反后 MSB-first 上线 |
+
+> **教训**: 网卡静默丢弃 (pktmon 零包) 的三大原因: runt <64B、FCS 错、字节错位。
+> FCS 错最容易在"自己验证自己"的闭环里漏掉 — 生成器 CRC 与校验方同源时, 必须拿
+> zlib/802.3 权威值做字节级比对。对照实验的"同一帧"要连 FCS 一起比对。
+
 ---
 
 ## 8. 实现状态
@@ -343,6 +357,11 @@ Buffer + ARP 表均通过 `#pragma HLS RESOURCE core=RAM_2P_BRAM` 推断为双�
 | ARP 条目 | — | 16 (UNROLL) | 16 | 16 | **264 (L1:8+L2:256)** |
 | 支持协议 | UDP | +ARP+ICMP+IGMP | +VLAN RX | +VLAN TX +ARP | **+DHCP** |
 | Bitstream | ✅ | — | — | ✅ | 待重新生成 |
+
+> **2026-08-18 全栈重综合 (xc7k325tffg676-2, 含 TCP/DHCP/stats 全部层)**: 27 BRAM_18K /
+> 4 DSP / 15,655 FF / **36,200 LUT** (17% 利用率, 器件从 20.8k 变 203.8k LUT 后不再紧张)。
+> 顶层为事件驱动 FSM (Latency/Interval = ?, 无 II 要求 — 与 uart_console 的
+> Latency 0 / Interval 1 铁律不冲突)。csim 14 项测试全过 (2026-08-18)。
 
 ### 8.4 各模块资源明细 (Phase 4)
 
@@ -401,6 +420,11 @@ eth_types.h  ←── eth_utils.h
 ---
 
 ## 10. Phase 5 最终实现报告
+
+> **ECO 移植后 (2026-08-18, xc7k325tffg676-2, 含全部层重综合)**: 网络 IP = 27 BRAM_18K /
+> 4 DSP / 15,655 FF / 36,200 LUT (17%); UART IP = 0 BRAM / 268 FF / 1,765 LUT,
+> **Latency 0 / Interval 1** ✓ (本表下方数据为 Artix-7 Phase-5 历史记录)。
+> Vivado 侧主工程 udp_dual_phy1g2 布线报告见 vivado_prj/; 板级结论见 PORT_NOTES.md。
 
 ### 10.1 双 IP 架构
 

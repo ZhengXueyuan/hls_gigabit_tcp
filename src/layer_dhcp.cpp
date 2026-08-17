@@ -11,9 +11,14 @@
 #include "eth_types.h"
 #include "eth_utils.h"
 
-// DHCP message buffer: 75 words (300 bytes) in TX scratch area
-#define DHCP_BUF_WORDS  75
-#define DHCP_BUF_BASE   (TX_SCRATCH_BASE)
+// DHCP TX frame layout in the shared buffer (contiguous, 82 words):
+//   IPv4 header (5 words) + UDP header (2 words) + DHCP message (75 words)
+// Frame base sits past the ARP/IGMP scratch area (TX_SCRATCH_BASE..+7) so
+// concurrent ARP/IGMP replies can't corrupt a frame mid-transmission.
+#define DHCP_BUF_WORDS   75
+#define DHCP_FRAME_BASE  (TX_SCRATCH_BASE + 32)
+#define DHCP_BUF_BASE    (DHCP_FRAME_BASE + 7)   // DHCP message follows IP+UDP headers
+#define DHCP_RX_BASE     (RX_BUFFER_BASE + 7)    // received DHCP message (20B IP + 8B UDP)
 
 //=============================================================================
 // Write DHCP fixed header to buffer
@@ -39,6 +44,46 @@ static void dhcp_build_header(uint32_t *buf, uint8_t op, uint32_t xid,
 }
 
 //=============================================================================
+// Build IPv4 + UDP headers for a DHCP frame (7 words at DHCP_FRAME_BASE)
+// src_ip = 0.0.0.0 for DISCOVER/REQUEST (client has no IP yet)
+//=============================================================================
+static void dhcp_build_headers(uint32_t *buf, uint16_t udp_len,
+                               uint32_t src_ip, uint32_t dst_ip) {
+    uint8_t ip[20];
+    ip[0] = 0x45; ip[1] = 0x00;                        // ver=4, IHL=5
+    ip[2] = (uint8_t)((IP_HEADER_BYTES + udp_len) >> 8);
+    ip[3] = (uint8_t)(IP_HEADER_BYTES + udp_len);      // total length
+    ip[4] = 0; ip[5] = 0;                              // ID
+    ip[6] = 0x40; ip[7] = 0x00;                        // DF, frag=0
+    ip[8] = 64; ip[9] = IP_PROTO_UDP;                  // TTL, protocol
+    ip[10] = 0; ip[11] = 0;                            // checksum (computed below)
+    ip[12] = (uint8_t)(src_ip >> 24); ip[13] = (uint8_t)(src_ip >> 16);
+    ip[14] = (uint8_t)(src_ip >> 8);  ip[15] = (uint8_t)src_ip;
+    ip[16] = (uint8_t)(dst_ip >> 24); ip[17] = (uint8_t)(dst_ip >> 16);
+    ip[18] = (uint8_t)(dst_ip >> 8);  ip[19] = (uint8_t)dst_ip;
+
+    uint16_t ip_words[10];
+    for (int i = 0; i < 10; i++) ip_words[i] = ((uint16_t)ip[i*2] << 8) | ip[i*2+1];
+    uint16_t csum = ones_complement_checksum(ip_words, 10);
+    ip[10] = (uint8_t)(csum >> 8); ip[11] = (uint8_t)csum;
+
+    uint8_t udp[8];
+    udp[0] = (uint8_t)(DHCP_CLIENT_PORT >> 8); udp[1] = (uint8_t)DHCP_CLIENT_PORT;
+    udp[2] = (uint8_t)(DHCP_SERVER_PORT >> 8); udp[3] = (uint8_t)DHCP_SERVER_PORT;
+    udp[4] = (uint8_t)(udp_len >> 8);          udp[5] = (uint8_t)udp_len;
+    udp[6] = 0; udp[7] = 0;                    // UDP checksum = 0 (not required)
+
+    for (int i = 0; i < 5; i++) {
+        buf[DHCP_FRAME_BASE + i] = ((uint32_t)ip[i*4]  << 24) | ((uint32_t)ip[i*4+1] << 16) |
+                                   ((uint32_t)ip[i*4+2] << 8)  | ip[i*4+3];
+    }
+    for (int i = 0; i < 2; i++) {
+        buf[DHCP_FRAME_BASE + 5 + i] = ((uint32_t)udp[i*4]  << 24) | ((uint32_t)udp[i*4+1] << 16) |
+                                       ((uint32_t)udp[i*4+2] << 8)  | udp[i*4+3];
+    }
+}
+
+//=============================================================================
 // Write a single byte to buffer at a byte offset (from DHCP_BUF_BASE)
 //=============================================================================
 static void dhcp_write_byte(uint32_t *buf, int byte_off, uint8_t val) {
@@ -50,10 +95,10 @@ static void dhcp_write_byte(uint32_t *buf, int byte_off, uint8_t val) {
 }
 
 //=============================================================================
-// Read a single byte from buffer at a byte offset
+// Read a single byte from buffer at a byte offset relative to a message base
 //=============================================================================
-static uint8_t dhcp_read_byte(uint32_t *buf, int byte_off) {
-    int wi = DHCP_BUF_BASE + (byte_off >> 2);
+static uint8_t dhcp_read_byte(uint32_t *buf, int base, int byte_off) {
+    int wi = base + (byte_off >> 2);
     int bi = byte_off & 0x3;
     return (buf[wi] >> ((3 - bi) * 8)) & 0xFF;
 }
@@ -74,15 +119,15 @@ static void dhcp_write_opt(uint32_t *buf, int &off, uint8_t code, uint8_t len,
 //=============================================================================
 // Read DHCP option: scan for <code>, return its length, copy up to 4 bytes
 //=============================================================================
-static uint8_t dhcp_read_opt(uint32_t *buf, int msg_bytes, uint8_t target, uint8_t *out) {
+static uint8_t dhcp_read_opt(uint32_t *buf, int base, int msg_bytes, uint8_t target, uint8_t *out) {
     int off = 240;
     while (off < msg_bytes - 1) {
-        uint8_t c = dhcp_read_byte(buf, off);
+        uint8_t c = dhcp_read_byte(buf, base, off);
         if (c == 255) break;
         if (c == 0) { off++; continue; }
-        uint8_t l = dhcp_read_byte(buf, off + 1);
+        uint8_t l = dhcp_read_byte(buf, base, off + 1);
         if (c == target && l <= 4) {
-            for (int i = 0; i < l; i++) out[i] = dhcp_read_byte(buf, off + 2 + i);
+            for (int i = 0; i < l; i++) out[i] = dhcp_read_byte(buf, base, off + 2 + i);
             return l;
         }
         off += 2 + l;
@@ -108,14 +153,15 @@ static void dhcp_rx_process(
     if (!udp_rx.valid) return;
     if (udp_rx.dst_port != DHCP_CLIENT_PORT) return;
 
-    // Read DHCP message type from options
+    // Read DHCP message type from options (message is in the RX buffer,
+    // right after the 20-byte IP header + 8-byte UDP header)
     uint8_t msg_type = 0;
-    dhcp_read_opt(buffer, udp_rx.payload_len, 53, &msg_type);
+    dhcp_read_opt(buffer, DHCP_RX_BASE, udp_rx.payload_len, 53, &msg_type);
 
     if (dhcp_state == DHCP_WAIT_OFFER && msg_type == DHCP_MSG_OFFER) {
-        offered_ip = buffer[DHCP_BUF_BASE + 4];  // yiaddr at word offset 4
+        offered_ip = buffer[DHCP_RX_BASE + 4];  // yiaddr at word offset 4
         uint8_t srv[4];
-        if (dhcp_read_opt(buffer, udp_rx.payload_len, 54, srv)) {
+        if (dhcp_read_opt(buffer, DHCP_RX_BASE, udp_rx.payload_len, 54, srv)) {
             server_ip = ((uint32_t)srv[0]<<24)|((uint32_t)srv[1]<<16)|((uint32_t)srv[2]<<8)|srv[3];
         }
         dhcp_state = DHCP_REQUEST;
@@ -152,7 +198,8 @@ static void dhcp_tx_process(
     }
 
     // Increment timer
-    if (dhcp_state != DHCP_IDLE && dhcp_state != DHCP_DONE) {
+    if (dhcp_state != DHCP_IDLE && dhcp_state != DHCP_DONE &&
+        dhcp_state != DHCP_FAILED) {
         dhcp_timer++;
     }
 
@@ -172,7 +219,10 @@ static void dhcp_tx_process(
             dhcp_state = (dhcp_state == DHCP_WAIT_OFFER) ? DHCP_DISCOVER : DHCP_REQUEST;
             dhcp_timer = 0;
         } else {
-            dhcp_state = DHCP_IDLE;  // give up
+            // Give up for good: DHCP_FAILED is never re-triggered by the
+            // (still asserted) start flag, so the DISCOVER flood stops.
+            dhcp_state = DHCP_FAILED;
+            retry_cnt  = 0;
         }
         return;
     }
@@ -188,24 +238,15 @@ static void dhcp_tx_process(
         dhcp_write_opt(buffer, off, 55, 4, 1,3,6,15);  // subnet, router, DNS
         dhcp_write_opt(buffer, off, 255, 0, 0,0,0,0);  // end
 
-        // Build UDP header for DHCP Discover (broadcast)
-        int hdr_base = TX_SCRATCH_BASE + DHCP_BUF_WORDS;
-        uint8_t udp_hdr[8];
-        udp_hdr[0] = (DHCP_CLIENT_PORT >> 8) & 0xFF;
-        udp_hdr[1] = DHCP_CLIENT_PORT & 0xFF;
-        udp_hdr[2] = (DHCP_SERVER_PORT >> 8) & 0xFF;
-        udp_hdr[3] = DHCP_SERVER_PORT & 0xFF;
-        uint16_t udp_len = 8 + DHCP_MSG_SIZE;
-        udp_hdr[4] = (udp_len >> 8) & 0xFF; udp_hdr[5] = udp_len & 0xFF;
-        udp_hdr[6] = 0; udp_hdr[7] = 0;
-        for (int i = 0; i < 2; i++)
-            buffer[hdr_base + i] = ((uint32_t)udp_hdr[i*4]<<24)|((uint32_t)udp_hdr[i*4+1]<<16)|
-                                   ((uint32_t)udp_hdr[i*4+2]<<8)|udp_hdr[i*4+3];
+        // Build IPv4 + UDP headers in front of the message, and start the
+        // frame at the IP header (the old code pointed past the message to
+        // the UDP header only — the NIC dropped the malformed frame)
+        dhcp_build_headers(buffer, 8 + DHCP_MSG_SIZE, 0, 0xFFFFFFFF);
 
         tx_req.dst_mac   = 0xFFFFFFFFFFFFULL;
         tx_req.ethertype = ETHERTYPE_IPV4;
-        tx_req.buf_addr  = hdr_base;
-        tx_req.buf_len   = 8 + DHCP_MSG_SIZE;
+        tx_req.buf_addr  = DHCP_FRAME_BASE;
+        tx_req.buf_len   = IP_HEADER_BYTES + 8 + DHCP_MSG_SIZE;
         tx_req.request   = true;
         dhcp_state = DHCP_WAIT_OFFER;
         dhcp_timer = 0;
@@ -220,20 +261,12 @@ static void dhcp_tx_process(
                        (uint8_t)(server_ip>>8), (uint8_t)server_ip);
         dhcp_write_opt(buffer, off, 255, 0, 0,0,0,0);
 
-        int hdr_base = TX_SCRATCH_BASE + DHCP_BUF_WORDS;
-        uint8_t udp_hdr[8];
-        udp_hdr[0] = (DHCP_CLIENT_PORT >> 8) & 0xFF; udp_hdr[1] = DHCP_CLIENT_PORT & 0xFF;
-        udp_hdr[2] = (DHCP_SERVER_PORT >> 8) & 0xFF; udp_hdr[3] = DHCP_SERVER_PORT & 0xFF;
-        uint16_t udp_len = 8 + DHCP_MSG_SIZE; udp_hdr[4] = (udp_len>>8)&0xFF; udp_hdr[5] = udp_len&0xFF;
-        udp_hdr[6] = 0; udp_hdr[7] = 0;
-        for (int i = 0; i < 2; i++)
-            buffer[hdr_base + i] = ((uint32_t)udp_hdr[i*4]<<24)|((uint32_t)udp_hdr[i*4+1]<<16)|
-                                   ((uint32_t)udp_hdr[i*4+2]<<8)|udp_hdr[i*4+3];
+        dhcp_build_headers(buffer, 8 + DHCP_MSG_SIZE, 0, 0xFFFFFFFF);
 
         tx_req.dst_mac   = 0xFFFFFFFFFFFFULL;
         tx_req.ethertype = ETHERTYPE_IPV4;
-        tx_req.buf_addr  = hdr_base;
-        tx_req.buf_len   = 8 + DHCP_MSG_SIZE;
+        tx_req.buf_addr  = DHCP_FRAME_BASE;
+        tx_req.buf_len   = IP_HEADER_BYTES + 8 + DHCP_MSG_SIZE;
         tx_req.request   = true;
         dhcp_state = DHCP_WAIT_ACK;
         dhcp_timer = 0;

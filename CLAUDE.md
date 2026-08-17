@@ -1,88 +1,55 @@
-# perfv — FPGA Network Protocol Stack (HLS)
+# udp_hls_eco — Kintex-7 ECO 板网络协议栈 (施工中)
 
-FPGA IP 协议栈项目，从 Verilog UDP echo demo 逐步演进为 HLS 全栈实现。
+perfv `udp_hls` HLS 网络协议栈移植到 ECO 板 (XC7K325T-2FFG676C) 的副本工程。
+原始工程 (D:\repo\perfv) 不改。移植总纲: `MIGRATION_K7325T.md`; 施工日志: `PORT_NOTES.md`
+(**每次实验先追加记录再动手**); 全局 HLS 铁律在用户 CLAUDE.md (ap_ctrl_none body II=1 /
+异步引脚同步器写在 wrapper / csim≠板级 等)。
 
-## 关键工程
+## 当前状态 (2026-08-18)
 
-| 目录 | 内容 | 状态 |
-|------|------|:--:|
-| `udp/` | 原始 Verilog UDP echo demo (Vivado 2018.1) | 参考 |
-| `stream_light/` | 原始 Verilog 流水灯 | 参考 |
-| `stream_light_hls/` | 流水灯 HLS 重写 | ✅ |
-| **`udp_hls/`** | **HLS 网络协议栈 (主工程)** | ✅ |
-| `uart_test/` | 参考 UART Verilog 实现 | 参考 |
+- ✅ UART console 板级通 (`?mac ?ip ?stat`), RX 通路逐字节验证完美
+- ✅ 协议栈 4 个 C++ bug 已修并重新综合 (03:45): MAC padding (runt) / DHCP 帧结构 /
+  DHCP 洪泛 / wrapper rx_last 极性。csim 14 项全过。
+- 🔧 **唯一遗留: FPGA TX 帧到不了 PC (pktmon 零包)**。已破案: demo 克隆生成器
+  eth_crc32 用 unreflected CRC → 线上 FCS 位反转 → 网卡静默丢。修复 (0xEDB88320
+  reflected) 已应用, 板级复核中 (agent 任务 #14 在跑, 别重复派活)。
+- ⬜ 端到端验证: ping → UDP 8080 → TCP 7 (TX 打通后)
 
-## udp_hls/ 工程概要
+## 工程结构
 
-- **器件**: xc7a35tftg256-1
-- **工具**: AMD Vitis HLS 2025.2 + Vivado 2025.2
-- **时钟**: e_rxc 125MHz (GMII PHY)
-- **接口**: GMII (AXI-Stream) + UART (调试控制台)
-
-### 架构 (双 IP)
-
-```
-IP1: 网络协议栈 @125MHz
-  MAC + ARP(L1+L2) + IP + ICMP + IGMP + TCP + UDP + DHCP + Stats
-  HLS: 34,180 LUT / 27 BRAM  |  Vivado: ~15,000 LUT (71%)
-
-IP2: UART Console @125MHz (同频直连, 无跨时钟域)
-  9600-8N1, AXI-Stream in
-  HLS: 5,274 LUT / 3 BRAM
-```
-
-### 源文件 (`src/`)
-
-| 文件 | 功能 |
+| 文件 | 内容 |
 |------|------|
-| `eth_types.h` | 协议类型, struct 定义, 常量 |
-| `eth_utils.h` | CRC32, IP checksum, bit_reverse |
-| `layer_mac.cpp` | MAC 层: GMII↔AXI-Stream, VLAN(802.1Q/802.1ad), CRC32 |
-| `layer_arp.cpp` | ARP: L1(8-LRU-LUT)+L2(256-BRAM), Reply+Request |
-| `layer_ip.cpp` | IP: checksum 校验, protocol 分发(1/2/6/17) |
-| `layer_icmp.cpp` | ICMP: Echo Reply (ping) |
-| `layer_igmp.cpp` | IGMPv1/v2: Membership Report |
-| `layer_tcp.cpp` | TCP: Reno+滑动窗口+RTO+MSS/WS options, 3连接, port 7 echo |
-| `layer_udp.cpp` | UDP: 8080 echo, ARP lookup integration |
-| `layer_dhcp.cpp` | DHCP: DORA sequence, IP 自动获取 |
-| `layer_stats.cpp` | 统计计数器 + ARP dump→msg_stream |
-| `udp_echo.cpp` | 顶层集成, HLS 入口 |
+| `src/*.cpp` | HLS 协议栈源码 (MAC/ARP/IP/ICMP/IGMP/TCP/UDP/DHCP/stats) |
+| `udp_echo_prj/solution1/syn/verilog/` | 网络 IP 综合产物 (36,200 LUT, 事件驱动 FSM 无 II 要求) |
+| `uart_hls/uart_prj/solution1/syn/verilog/` | UART IP (1,765 LUT, **必须 Latency 0 / Interval 1**) |
+| `wrapper_1g.v` | 主顶层: MMCM 200M + util_gmii_to_rgmii (k720 逐字) + RX/TX FIFO 帧桥 + demo 克隆生成器 + net_stats |
+| `net_stats.v` | UART 探针: `?net ?txd ?rxd ?raw` (计数+帧捕获, 50MHz 独立) |
+| `xdc/eco_rgmii_phy1.xdc` | 引脚 + 时钟约束 (phy1_rxc 8ns master + BUFG 反相 generated) |
+| `wrapper_min*.v` + `eth_rebuild_*.v` + `eth_test_gen.v` | 调试变体 (demo 重建 bisect 用) |
 
-### 构建流程
+## 构建
 
-1. `run_hls.bat` → 网络 IP HLS 综合 (csim + csynth)
-2. `uart_hls/run_hls.tcl` → UART IP HLS 综合
-3. `run_vivado_wrapper.tcl` → Vivado synth+impl+bitstream
-4. `program.tcl` → 烧录
-
-### HLS 关键约束
-
-```cpp
-#pragma HLS INTERFACE axis port=rx_stream    // AXI-Stream
-#pragma HLS INTERFACE ap_ctrl_none port=return // free-running
-config_rtl -reset all -reset_async -reset_level low
+```bash
+cmd //c run_hls.bat                       # 网络 IP (csim+csynth)
+cd uart_hls && cmd //c run_hls.bat        # UART IP
+cmd //c run_vivado_phy1g2.bat             # 主工程 → vivado_prj/udp_dual_phy1g2/.../wrapper_1g.bit
+vivado -mode batch -source program_eco.tcl -tclargs <bit 路径>   # 烧录 JTAG 1MHz
 ```
 
-- 时钟: 125MHz (8ns), 异步低复位
-- 层间通信: struct 引用 (非 stream, 避免 FIFO 开销)
-- 共享 buffer: `static uint32_t buffer[512]` → BRAM 推断
-- ARP table: `static arp_entry_t[256]` → BRAM
-- TCP conn: `static tcp_conn_t[MAX_TCP_CONN]` → BRAM
+## 板级调试工具
 
-### 常见问题
+- UART COM8 9600-8N1 (PowerShell + System.IO.Ports); `udp_console_test.ps1` / `net_test.ps1`
+- PC 抓包: pktmon comp 117 (Killer E5000B) 混杂模式; demo bitstream 对照实验同板同线
+- 验证 ping 必须确认走有线网卡 (WLAN 假阳性, 用户纠正过)
 
-1. **pragma 必须在函数内**: `#pragma HLS RESOURCE` 不能放在文件作用域
-2. **`uint8_t` 索引截断**: 地址 ≥256 时需用 `uint16_t`
-3. **跨周期变量**: 用 `static` 保存，不依赖 `rx.xxx = 0` (每周期清零)
-4. **`fpga_gclk` 未用**: 声明但不连接会导致 DONE=LOW，需移除端口
-5. **DONE=LOW 调试**: 先分别测各 IP 能否独立烧录, 定位问题 IP; 若均失败 → JTAG 降频 1MHz 重试
-6. **UART 同频**: 当前 UART 与网络共用 e_rxc (125MHz)，波特率分频=13020
-7. **JTAG 降频**: 板级烧录 DONE=LOW 时用 `set_property PARAM.FREQUENCY 1000000 $target` (默认高频不稳)
+## 本工程特有坑 (教训)
 
-### 板级信息
-
-- 目标板: Digilent/210203367162A
-- MAC: 00:0A:35:01:FE:C0
-- IP: 静态 192.168.0.2 / DHCP 自动
-- UART: 9600-8N1, P9(RX)/N9(TX)
-- 命令: `?help ?mac ?ip ?dhcp ?arp ?stat`
+1. **网卡静默丢弃三原因**: runt <64B / FCS 错 / 字节错位 — FCS 错最容易在"自己验证自己"
+   的闭环里漏掉 (生成器 CRC 与校验方同源)。对照实验的"同一帧"必须字节级比对 FCS。
+2. HLS IP 是 call-based: TVALID 帧内空洞、TREADY 仅外层 FSM 拉高 → wrapper 必须用
+   FIFO 整帧缓冲桥 (TX 2048×9, TLAST=TDATA[8], ≥12 周期 IFG)。
+3. k720 工程的"实际" ethernet_test ≠ src/ 树 (工程版带 gmii_arbi+mac_test+6 个 Xilinx IP),
+   对照位流按工程版还原。
+4. ODDR 的 Q 只能接 OBUF/port — 想在 ODDR 输出采样 pad 电平要用 IOBUF (T=0)。
+5. 功率门控实验若把 IP 复位 (ip_enable=0), 其 TX regslice 会打垃圾帧污染线上 TXEN —
+   必须同时门控 tx_push; 且 Vivado 会把常复位 IP 优化掉 (利用率失真)。

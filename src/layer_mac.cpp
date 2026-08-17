@@ -255,16 +255,22 @@ static void mac_tx_process(
 
         case MAC_TX_SENDDATA:
             {
-                uint16_t word_idx = req_wbase + (sent_bytes >> 2);
-                uint8_t  byte_off = sent_bytes & 0x3;
-                uint32_t w = buffer[word_idx];
-                uint8_t bd = (w >> ((3 - byte_off) * 8)) & 0xFF;
+                uint8_t bd;
+                if (sent_bytes < req_bytes) {
+                    uint16_t word_idx = req_wbase + (sent_bytes >> 2);
+                    uint8_t  byte_off = sent_bytes & 0x3;
+                    uint32_t w = buffer[word_idx];
+                    bd = (w >> ((3 - byte_off) * 8)) & 0xFF;
+                } else {
+                    bd = 0;  // zero-pad: 46-byte min payload for a 64-byte frame
+                }
 
                 gmii_byte_t b; b.data = bd; b.last = false;
                 tx_stream.write(b);
-                crc_reg = crc32_byte(bd, crc_reg);
+                crc_reg = crc32_byte(bd, crc_reg);   // pad bytes ARE part of the frame
                 sent_bytes++;
-                if (sent_bytes == req_bytes) { byte_cnt = 0; state = MAC_TX_SENDCRC; }
+                uint16_t tx_payload = (req_bytes < 46) ? (uint16_t)46 : (uint16_t)req_bytes;
+                if (sent_bytes == tx_payload) { byte_cnt = 0; state = MAC_TX_SENDCRC; }
             }
             break;
 

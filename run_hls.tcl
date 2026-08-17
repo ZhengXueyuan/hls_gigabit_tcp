@@ -9,7 +9,7 @@ add_files -tb tb/udp_echo_tb.cpp
 set_top udp_echo
 
 open_solution -reset solution1
-set_part {xc7a35tftg256-1}
+set_part {xc7k325tffg676-2}
 create_clock -period 8 -name default
 
 # Reset: async, active low

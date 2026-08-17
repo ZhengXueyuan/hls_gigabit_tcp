@@ -14,6 +14,10 @@
 #include "eth_types.h"
 #include "eth_utils.h"
 
+// ARP lookup (defined in layer_arp.cpp — same translation unit).
+// The arp_entry_t* parameter is unused (tables are file-static in layer_arp.cpp).
+bool arp_lookup(arp_entry_t *table, ap_uint<32> ip, mac_addr_t &mac);
+
 //=============================================================================
 // ICMP checksum computation
 //=============================================================================
@@ -159,7 +163,14 @@ static void icmp_rx_process(
         uint16_t total_buf_len = IP_HEADER_BYTES + icmp_total_len;
 
         // Issue TX request
-        tx_req.dst_mac   = 0;  // Will be filled by ARP lookup (upper layer)
+        // The reply must go to the sender's MAC. On a direct link the sender
+        // ARPed for us (or was learnt from any ARP frame), so resolve its MAC
+        // from the ARP cache by source IP. Fallback: broadcast if unknown.
+        mac_addr_t reply_mac = 0xFFFFFFFFFFFFULL;
+        if (arp_lookup(NULL, ip_rx.src_ip, reply_mac)) {
+            // unicast reply to sender
+        }
+        tx_req.dst_mac   = reply_mac;
         tx_req.ethertype = ETHERTYPE_IPV4;
         tx_req.buf_addr  = TX_SCRATCH_BASE;
         tx_req.buf_len   = total_buf_len;

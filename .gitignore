@@ -1,7 +1,6 @@
 # HLS build artifacts
 *_prj/
 solution1/
-*.log
 logs/
 
 # Vivado build artifacts
@@ -9,8 +8,41 @@ vivado_prj/
 uo_prj/
 qt_prj/
 test_prj/
+.Xil/
 *.jou
 *.str
+*.log
+*.backup.log
+*.backup.jou
+*.bit
+*.wdb
+*.pb
+vivado_*.backup.*
+xsim_*.backup.*
+
+# XSim workspaces / debug workspaces
+xsim.dir/
+demo_sim/
+sim_patch/
+crc_check/
+xelab.log
+xelab.pb
+xvlog.log
+xvlog.pb
+xsim.log
+xsim.jou
+dfx_runtime.txt
+
+# pktmon captures / netlist dumps / timing dumps / forensic one-off scripts
+*.etl
+pk*.txt
+dump*.txt
+dump_tx*.tcl
+check_*.txt
+cmp_*
+
+# Python
+__pycache__/
 
 # Temporary files
 *.exe

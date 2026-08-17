@@ -70,6 +70,7 @@ struct gmii_byte_t {
 #define DHCP_REQUEST   3
 #define DHCP_WAIT_ACK  4
 #define DHCP_DONE      5
+#define DHCP_FAILED    6   // gave up after retries — stays quiet until reset
 
 // Multicast group the board listens to (configurable)
 #define BOARD_MCAST_BYTE0  239
@@ -103,9 +104,9 @@ struct gmii_byte_t {
 
 #define BOARD_IP_BYTE0  192
 #define BOARD_IP_BYTE1  168
-#define BOARD_IP_BYTE2  0
+#define BOARD_IP_BYTE2  100
 #define BOARD_IP_BYTE3  2
-// BOARD_IP = 192.168.0.2
+// BOARD_IP = 192.168.100.2 (PC NIC = 192.168.100.1/24)
 
 //=============================================================================
 // Frame size constants
@@ -135,7 +136,13 @@ struct gmii_byte_t {
 //=============================================================================
 // Timing
 //=============================================================================
-#define TX_PACING_COUNT  0x00000100   // ~2us between frames @ 125MHz
+#ifdef __SYNTHESIS__
+// RTL: ~5s between HELLO frames @ 125MHz (625,000,000 < 2^32, fits the uint32_t counter)
+#define TX_PACING_COUNT  625000000
+#else
+// csim: keep the legacy fast pacing so the TB's frame-drain helpers run quickly
+#define TX_PACING_COUNT  0x00000100
+#endif
 
 //=============================================================================
 // MAC address type (6 bytes in a 64-bit container)

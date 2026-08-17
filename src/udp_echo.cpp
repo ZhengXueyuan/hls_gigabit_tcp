@@ -25,12 +25,20 @@ void udp_echo(
     bool                      reset_n,
     hls::stream<gmii_byte_t> &rx_stream,
     hls::stream<gmii_byte_t> &tx_stream,
-    hls::stream<gmii_byte_t> &msg_stream     // debug messages → UART IP
+    hls::stream<gmii_byte_t> &msg_stream,    // debug messages → UART IP
+    bool                     &led_d0,        // LED D0 (M16)
+    bool                     &led_d1,        // LED D1 (N16)
+    bool                     &led_d2,        // LED D2 (P15)
+    bool                     &led_d3         // LED D3 (P16)
 ) {
     #pragma HLS INTERFACE ap_none port=reset_n
     #pragma HLS INTERFACE axis port=rx_stream
     #pragma HLS INTERFACE axis port=tx_stream
     #pragma HLS INTERFACE axis port=msg_stream
+    #pragma HLS INTERFACE ap_none port=led_d0
+    #pragma HLS INTERFACE ap_none port=led_d1
+    #pragma HLS INTERFACE ap_none port=led_d2
+    #pragma HLS INTERFACE ap_none port=led_d3
     #pragma HLS INTERFACE ap_ctrl_none port=return
 
     // Shared resources
@@ -167,4 +175,10 @@ void udp_echo(
     if (tx_req.request && last_tx==0) { stats_event(1, tx_req.buf_len+18); } // +MAC+CRC
     last_tx = tx_req.request ? 1 : 0;
     stats_report(reset_n, msg_stream, stats_should_dump());
+
+    // DHCP status output for wrapper-level LED logic
+    led_d0 = (dhcp_state == DHCP_DONE);   // 1 = DHCP acquired
+    led_d1 = false;
+    led_d2 = false;
+    led_d3 = false;
 }
