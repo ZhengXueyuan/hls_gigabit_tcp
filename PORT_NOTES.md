@@ -731,3 +731,29 @@ end
   重建 → ping / UDP 8080 / TCP 7 全链验证。
 - 教训: ① FCS 的"标准"有实现歧义, 必须以板级/权威 demo 的线上字节为基准, 不能以自己
   的参考实现自证; ② 全帧逐字节对比 (含 FCS) 才是对照实验的正确姿势 — 之前只比了前 24 字节。
+
+## 2026-08-18 上午终 — ✅ 全链打通: ping 4/4 (0ms), UDP 8080 待查
+
+### ICMP 校验和第二个 bug (定位+修复+板级验证)
+- 现象: FCS 修复后 FPGA 的 ARP/ICMP 回复帧到达 PC (pktmon 可见完整解码), 但 Windows
+  ping 仍 100% 超时。
+- 用 pktmon --hex 抓到 FPGA 的 ICMP echo reply 原始字节, Python 独立校验:
+  IP 头校验和 = B16C 正确; **ICMP 校验和 = 4600, 正确应为 46D4** → Windows 静默丢弃。
+- 反推 C++ 算法精确复现 4600: `buffer[tx_base] &= 0xFFFF00FF` 只清零了校验和字段的
+  高字节 (bits 15-8), **低字节残留了请求的校验和 (3E D4 → 残留 D4)** → 求和多 0x00D4 →
+  校验和错。修复: `&= 0xFFFF0000` (清零全部 16 位)。
+- 教训: csim 的 ICMP 测试只查 type/payload, 不查校验和 → 自证闭环再次漏检。已给 TB 加
+  ICMP 回复校验和检查 (防回归)。UDP/TCP 回复路径的校验和也要独立验证 (UDP 8080 仍不通,
+  待查: 大概率是 UDP RX 校验和/回复构造同类问题)。
+
+### ✅ 最终板级验证 (2026-08-18 09:05 位流)
+- **ping 192.168.100.2: 4/4 回复, 0% 丢失, 0ms** ✓✓✓
+- pktmon: FPGA ARP 回复 / ICMP echo reply / demo 克隆 ARP 广播全部到达 PC。
+- UDP 8080 echo: 超时 (下一轮待查)。
+- 构建: run_vivado_phy1g2.bat → vivado_prj/udp_dual_phy1g2.runs/impl_1/wrapper_1g.bit
+  (ip_enable=1, FCS LSB-first, ICMP 校验和修复)。
+
+### 下一轮 (UDP 8080 调试)
+1. 抓 FPGA 的 UDP 回复帧 (pktmon --hex), 独立校验 IP/UDP 校验和与内容。
+2. 检查 layer_udp.cpp 的 RX 校验和验证逻辑 (可能丢弃了请求) 和回复构造。
+3. 之后: TCP 7 echo。

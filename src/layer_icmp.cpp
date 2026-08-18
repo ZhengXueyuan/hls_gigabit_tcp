@@ -94,7 +94,11 @@ static void icmp_rx_process(
         buffer[tx_base] = w0;
 
         // Clear checksum field (bytes 2-3 of ICMP header)
-        buffer[tx_base] &= 0xFFFF00FF;  // zero out checksum
+        buffer[tx_base] &= 0xFFFF0000;  // FIX 2026-08-18: clear BOTH checksum
+                                      // bytes (0xFFFF00FF only cleared byte 2;
+                                      // the request's checksum low byte leaked
+                                      // into the sum -> wrong ICMP checksum
+                                      // -> Windows dropped every echo reply).
 
         // Recompute ICMP checksum over (header + data)
         // Build a byte array of the ICMP message for checksum computation

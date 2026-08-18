@@ -302,12 +302,14 @@ Buffer + ARP 表均通过 `#pragma HLS RESOURCE core=RAM_2P_BRAM` 推断为双�
 | DHCP 无限洪泛 | ~134ms/次重发刷屏 | 失败路径无退避, retry 立即重来 | DHCP_FAILED(6) 状态 + retry_cnt 复位 |
 | wrapper rx_last_in 极性反 | IP 永不 complete 帧 | dv 上升沿被误当帧尾 | `rx_dv_d2 && !rx_dv_d1` (下降沿) 并 push rx_d2 |
 | demo 克隆生成器 FCS 错 (双重) | **所有 demo 克隆实验的帧被网卡当 FCS 错静默丢弃** (pktmon 零包) | ① eth_crc32 用 unreflected MSB-first CRC (线上 21 27 d6 68) ② 修复后又用 MSB-first 字节序 (线上 63 F9 A3 CA) — 本板 PHY/PC 链只接受 LSB-first | reflected CRC-32 (0xEDB88320) + 按 fcs[7:0],[15:8],[23:16],[31:24] 发出 (线上 CA A3 F9 63 = demo 帧字节)。板级验证 pk21 = 25 帧 ✓ |
+| ICMP 回复校验和错 | ping 帧到达 PC (pktmon 可见) 但 Windows 100% 超时 | `buffer[tx_base] &= 0xFFFF00FF` 只清零校验和字段高字节, 请求校验和低字节 (0xD4) 残留污染求和 → 线上 4600 (应 46D4) | `&= 0xFFFF0000` (清全部 16 位); TB 加 ICMP 回复校验和检查。板级验证 ping 4/4 0ms ✓ |
 
-> **教训 (FCS 铁律)**: 网卡静默丢弃 (pktmon 零包) 的三大原因: runt <64B、FCS 错、字节错位。
+> **教训 (FCS/校验和铁律)**: 网卡静默丢弃 (pktmon 零包) 的三大原因: runt <64B、FCS 错、字节错位。
 > FCS 的"标准"有实现歧义 (多项式 AND 线上字节序) — "自己验证自己"的闭环 (生成器 CRC 与
 > 校验方同源) 两重都漏掉过。**必须以权威 demo 位流的线上字节为基准做全帧逐字节比对**
-> (之前只比前 24 字节, 恰好漏掉 FCS 字段)。本板 PHY/PC 链: 线上 FCS = complemented
-> reflected-CRC-32 寄存器的小端字节序。
+> (之前只比前 24 字节, 恰好漏掉 FCS 字段)。线上校验和/内容问题用 `pktmon etl2txt --hex`
+> 抓原始字节 + Python 等独立参考实现校验 (ICMP 校验和 bug 同此定位)。本板 PHY/PC 链:
+> 线上 FCS = complemented reflected-CRC-32 寄存器的小端字节序。
 
 ---
 

@@ -166,7 +166,15 @@ void test_icmp() {
         // capture() includes the 8-byte preamble (see EtherType at cap[20] = 12+8),
         // so dst_mac starts at cap[8]
         CHECK(cap[8]==0x10&&cap[9]==0x11&&cap[10]==0x12&&cap[11]==0x13&&cap[12]==0x14&&cap[13]==0x15,"reply dst_mac == sender MAC");
-        CHECK(cap[icmp+8]=='p'&&cap[icmp+9]=='i',"payload intact");}
+        CHECK(cap[icmp+8]=='p'&&cap[icmp+9]=='i',"payload intact");
+        // verify the reply's ICMP checksum (FIX regression guard)
+        int ilen=n-8-4-icmp;   // ICMP message length (payload 4 + hdr 8)
+        uint8_t cbuf[64]; for(int i=0;i<ilen;i++) cbuf[i]=cap[icmp+i];
+        cbuf[2]=0; cbuf[3]=0;   // zero the checksum field
+        uint32_t s=0; for(int i=0;i<ilen-1;i+=2) s+=((uint16_t)cbuf[i]<<8)|cbuf[i+1];
+        while(s>>16)s=(s&0xFFFF)+(s>>16);
+        uint16_t exp=~s; uint16_t got=((uint16_t)cap[icmp+2]<<8)|cap[icmp+3];
+        CHECK(exp==got,"ICMP reply checksum");}
 }
 
 void test_igmp_v2() {

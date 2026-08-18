@@ -15,9 +15,11 @@ perfv `udp_hls` HLS 网络协议栈移植到 ECO 板 (XC7K325T-2FFG676C) 的副�
   被网卡静默丢)。修复 = reflected CRC-32 (0xEDB88320) + 按 fcs[7:0],[15:8],[23:16],[31:24]
   发出, 已应用到全部 7 个 Verilog 生成器 + HLS layer_mac.cpp。wrapper_min 板级验证:
   pktmon 25s = 25 帧 FPGA ARP ✓ (与 demo 逐字节一致)。
-- 🔄 进行中 (agent 任务 #14): HLS IP 重综合 + wrapper_1g (ip_enable=1) 重建 →
-  烧录 → 端到端 ping → UDP 8080 → TCP 7 全链验证。
-- ⬜ 端到端验证: ping → UDP 8080 → TCP 7 (任务 #12)
+- ✅ **端到端 ping 已通** (2026-08-18 09:05 位流): ping 192.168.100.2 4/4 回复 0ms。
+  ICMP 校验和第二 bug 修复: `buffer[tx_base] &= 0xFFFF00FF` 只清了校验和字段高字节,
+  请求校验和低字节 (0xD4) 残留污染求和 → 改 `&= 0xFFFF0000`; TB 已加校验和检查。
+- ⬜ 下一轮: UDP 8080 echo (当前超时 — 疑 UDP RX 校验和验证/回复构造同类问题,
+  用 pktmon --hex 独立校验线上字节) → TCP 7 echo。
 
 ## 工程结构
 
