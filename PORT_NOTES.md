@@ -757,3 +757,210 @@ end
 1. 抓 FPGA 的 UDP 回复帧 (pktmon --hex), 独立校验 IP/UDP 校验和与内容。
 2. 检查 layer_udp.cpp 的 RX 校验和验证逻辑 (可能丢弃了请求) 和回复构造。
 3. 之后: TCP 7 echo。
+
+## 2026-08-18 22:40 — 下一轮: UDP 8080 / TCP 7 调试 (agent 现场)
+
+### 代码审查结论 (先于板级实验)
+- layer_udp.cpp / udp_echo.cpp 链路 (MAC RX 剥 14B 头 → buffer word0=IP 头):
+  - UDP RX 无校验和验证 (请求一律放行, 不是丢包原因)。
+  - 回复帧内容核对 (IP total=36 / UDP len=16 / buf_len=36 / payload 复制偏移=RX+7 word) 自洽。
+  - **疑点 A (时序)**: UDP echo 不立即回复, 而是等 TX_PACING_COUNT (RTL=625,000,000 周期
+    @125MHz ≈ **5 秒**) 的下一个节拍才发 — 任何短于 5s 的客户端超时都会"超时无回复"。
+  - **疑点 B (端口)**: 回复的 UDP 目的端口硬编码 = 8080 (ipudp_hdr[22..23]), 不回填请求的
+    源端口 → UdpClient 用临时端口 (默认) 时, 回复发到 PC:8080 没人听 → 必超时。
+  - **疑点 C (TCP)**: layer_tcp.cpp 新建连接分支 `if(cid<0&&SYN&&!ACK)` — 但 tcp_find()
+    无匹配时返回的是**空闲槽索引 (>=0)**, 恒不等于 <0 → SYN 初始化永远不执行 → 随后
+    state==T_FREE 直接 return → **SYN 被丢弃, TCP 永远无法建连**。
+- 铁律复查: TB (udp_echo_tb.cpp) 只有 ICMP 回复校验和检查, **无 UDP echo 回复/端口断言、
+  无 TCP SYN-ACK 断言** → 自证闭环再次漏检 (同 FCS/ICMP 两次的教训)。
+
+### 板级取证实验 (当前位流, 22:30 烧录)
+- 目的: 用 pktmon --hex 确认 (1) FPGA 是否回 HELLO/echo 帧 (2) 回复延迟 (3) 回复目标端口。
+- 方法: pktmon comp 117 --flags 0x20 + UDP 客户端测试 (临时端口 + 绑定 8080 各一轮, 8s 超时)。
+
+### 取证结果 (pk_udp1, 40s, 22:35-22:36) — 根因实锤
+- PC → FPGA 的 UDP 请求已上到线上 (53365/57809 → 8080, "hello ECO" 9B)。
+- FPGA 40s 内 41 帧全部是 ARP (demo 克隆 1Hz 广播 + 1 个 ARP 回复), **UDP/HELLO 帧 0**。
+- RTL 排查 (udp_echo.v): udp_tx_process 在顶层 FSM state23 启动; 每次顶层 pass ≈30-50 周期
+  (state1→28 循环, 含各子块 ap_done 等待)。time_cnt 每 pass +1 → TX_PACING_COUNT=625M pass
+  ≈ **数分钟才 tick 一次** (csim 1 call=1 pass, 0x100=256 所以 TB 里正常) → echo 回复永远等不到
+  节拍, HELLO 也几乎不发。**这就是 UDP 8080 超时的根因** (ICMP 立即回复所以 ping 通)。
+- 次要 bug: 回复 dst_port 硬编码 8080 (不回填请求源端口), 客户端临时端口收不到。
+- **TCP 硬 bug (代码级)**: layer_tcp.cpp 新连接条件 `cid<0&&SYN&&!ACK` 恒假 — tcp_find()
+  无匹配时返回空闲槽索引 (>=0) → SYN 初始化永不执行 → state==T_FREE return → SYN 丢弃。
+- 修复方案: ① UDP echo 立即回复 (同 ICMP 模式), dst_port 回填请求 src_port;
+  ② TCP SYN 分支改判空闲槽; ③ 顺带修 TCP SYN 选项未上线 (total=20 但 doff=7) + 选项越界读
+  th[20+o]; ④ TB 加 UDP echo / TCP SYN-ACK 防回归断言。
+
+### 修复 (2026-08-18 23:xx, 源码已改, csim 全过)
+1. **layer_udp.cpp / udp_echo.cpp — UDP echo 立即回复 + 端口/IP 回填**:
+   - 原逻辑把 echo 绑在 TX_PACING_COUNT (625M pass, RTL 里数分钟才 tick) 上 → 测试窗口内永不回复。
+   - 改为 data_received 时同 pass 立即构造回复 (同 ICMP 模式); HELLO 仍走节拍。
+   - 回复 dst_port = 请求源端口 (原硬编码 8080), dst IP = 请求源 IP (原硬编码 .100.1),
+     ARP 查表失败时广播兜底 (HELLO 路径才发 ARP request)。
+   - data_received 在 MAC 忙时保留到下个 pass (不再误清)。
+2. **layer_mac.cpp — MAC busy 互斥 (新发现 bug)**: mac_tx_process 输出 tx_busy
+   (= state!=IDLE || tx_req.request); udp_tx_process 只在 !request && !busy 时运行 —
+   否则 HELLO 节拍会在 MAC 正在从 TX_UDP_BASE 发帧时重写 buffer, 把在途帧打成混合帧
+   (csim 复现: TCP echo 帧被 HELLO 覆盖, iptot 混 42/proto 17)。TCP tcp_send 写 TX_UDP_BASE
+   未加门控 (板级碰撞概率 ~2e-9, 只损坏 HELLO 帧, 列为遗留)。
+3. **layer_tcp.cpp — 3 处**:
+   - SYN 新建连接条件 `cid<0` 恒假 → 改判 `cid>=0 && state==T_FREE && SYN` (tcp_find 无匹配
+     返回空闲槽索引, 原逻辑 SYN 全被丢, TCP 永远无法建连)。
+   - SYN/SYN-ACK 的 8 字节选项实际没上线 (total 只算 20B 但 doff=7) → total 按 TCP_MAX_HDR 计。
+   - 选项解析从 th[20+o] 越界读 → 改从 RX buffer 读, wscale 钳位 0..7。
+   - tcp_send 目标 MAC 走 ARP 缓存 (同 ICMP), 失败广播兜底。
+4. **tb/udp_echo_tb.cpp — 防回归**: 新增 test_udp_echo (立即回复/源端口回填/IP 校验和/UDP 长度/
+   FCS/帧长非 runt/单播 MAC 断言) + test_tcp_syn (SYN-ACK flags/端口/ACK=seq+1/doff=7/MSS 上线/
+   IP+TCP 校验和, 握手后数据回显校验)。csim EXIT=0。
+
+### 板级验证流程 (进行中)
+- run_hls.bat (csim+csynth+export) → run_vivado_phy1g2.bat → 烧录 → udp_test.ps1 (临时端口 +
+  固定 8080 各一轮) + tcp_test.ps1 -Server 192.168.100.2 -Port 7 + pktmon --hex 复核。
+
+## 2026-08-18 深夜 — TCP 大载荷调通 (csim 全过, 板级验证中)
+
+### 板级首测结果 (23:2x 位流, 含 UDP 修复)
+- **UDP 8080: 6/6 PASS** (临时端口 54671-3 + 固定 8080, 0-5ms), pktmon hex 复核:
+  回复 dst 端口=请求源端口, IP csum B173 ✓, 目标 MAC=PC 单播。
+- **TCP 7: 100B PASS** (connect 14ms echo 21ms), SYN-ACK 带选项 [mss 536,wscale 7,nop] 上线,
+  IP csum B173/TCP csum bd6a 独立复核 ✓。
+- **TCP >536B FAIL** (1200/2000B 超时) → 触发本轮 TCP 深挖。
+
+### TCP 深挖发现的 6 个 bug (全部已修, csim 全过)
+1. **uint8_t inc 截断**: `c.seq+=inc` 的 inc 是 uint8_t → 472B 分片 seq 只 +216 → 连接失步。
+2. **TCP_BUF_BASE staging+拷贝重叠**: 源区 (272..394) 覆盖目的帧 IP 头 (384..388) 且与目的区
+   (389+) 自重叠 → 大分段把刚写的 IP 头复制进载荷 (csim 复现: 载荷偏移 428 处=自身 IP 头)。
+   → 改为 seg[] 直接写 ipb+5, 删掉两次拷贝。
+3. **flush 一次发多段**: MAC TX 单缓冲 (一个 tx_req + 一个共享区), 循环里第二次 tcp_send 在
+   同 pass 覆盖第一次的帧 → 每次 flush 只发一个分片。
+4. **send_offset 被清零**: 新段到达时 `send_offset=0` → 已回显的字节被重发 (总发送 2424>2000)。
+5. **发送块无界**: 536B 分片超出 TX 区 (384..511 只容 472B 载荷) → TCP_TX_CHUNK=472 上限。
+6. **尾部数据无人发**: 纯 ACK 不触发 flush + MAC 忙时 flush 跳过 → 加 tcp_maintenance()
+   (每 pass 空闲时补发排队数据) + flush-on-ACK。
+
+### 其余修复
+- SYN-ACK 选项真正上线 (total 含 TCP_MAX_HDR), 选项从 RX buffer 解析 (原 th[20+o] 越界),
+  wscale 钳位 0..7, 目标 MAC 走 ARP 缓存。
+- send_buf 扩到 4×MSS 且队列有界。
+- TB: 新增 TCP SYN-ACK 断言 (flags/端口/ACK/doff/MSS/校验和) + 2000B 四分段回显测试
+  (逐段喂-收, 校验 seq/帧长/载荷全局模式), UDP echo 测试 (源端口回填/校验和/帧长/FCS)。
+
+## 2026-08-19 凌晨 — TCP 大载荷板级调通 (第三轮, 进行中)
+
+### 第二轮板测结果 (00:07 位流)
+- UDP 3/3 ✓, TCP 100B ✓, **TCP 1200/2000/4096: 收到 472B 后停** (chunk1 通, 后续全丢)。
+- pktmon 证据: FPGA 其实发了全部 4 块 (472+64+472+192=1200), 但 chunk2 载荷 =
+  [客户端字节 536..599] 而非 [472..535] — 内容错位, Windows 校验和/内容丢弃。
+- chunk3 中段还出现 send_buf 读回绕 (598→46) — RTL 与 csim 分歧实锤。
+
+### 根因 (RTL 层)
+1. **flush-on-ACK 对数据段也触发**: 我加的 `flush queued data on ACK` 条件未限制 plen==0,
+   数据段处理完 flush 后又触发第二次 flush → 同 pass 第二次 tcp_send 覆盖第一次的帧。
+2. **send_buf 内嵌在 tcp_conn struct**: HLS 把大字节数组压平进连接 BRAM, 寻址与 csim 分歧
+   (读偏移错位 + 回绕) — 板级 chunk2 读到 seg2 的数据、chunk3 读到 598→46 回绕。
+
+### 修复
+1. flush-on-ACK 只对纯 ACK (plen==0) 生效。
+2. send_buf 移出 struct → 全局 `tcp_send_bufs[MAX_TCP_CONN][4*MSS]` 独立 BRAM
+   (与 tcp_retrans_buf 相同模式, `#pragma HLS RESOURCE ... RAM_2P_BRAM`)。
+3. tcp_flush_send 单次化 (无循环无 break, 最小化 HLS 调度)。
+- csim 全过 (recv_total=2000, 无失配)。重建/烧录/板测进行中。
+
+## 2026-08-19 凌晨续 — TCP 回显改为 tail 极简架构 (第三轮重建中)
+
+### 第三轮板测 (00:31 位流, send_buf 独立 BRAM + flush-on-ACK 限 plen==0)
+- 依旧 472/1200, 且线上错位模式与上轮完全相同 (chunk2=[536..599], chunk3=62 正确后回绕)。
+- **结论: 不是 send_buf 寻址, 而是 RTL 对 send_len/send_offset/c.seq 的 BRAM 字段读写
+  调度与 csim 顺序语义分歧** (offset 记账与载荷指针取值不一致)。
+
+### 架构决策: tail 极简回显 (放弃 backlog/flush/cwnd 门控全套)
+- 每个段 ≤ TCP_TX_CHUNK(472) 时同 pass 立即回显 (ICMP 同款模式, 无任何排队状态);
+  >472 的段 (即 536B MSS 段) 尾部 ≤64B 存入小型寄存器数组 tcp_tail_buf,
+  由 tcp_maintenance 在 MAC 空闲时补发 (乱序由 TCP seq 重排兜底)。
+- 删除: send_buf/send_len/send_offset/tcp_flush_send/cwnd 门控。
+- csim 全过 (recv_total=2000 无失配)。重建/烧录/板测进行中。
+
+## 2026-08-19 凌晨终 — TCP 根因锁定: tcp_send 未与 MAC 发送互斥 (重建中)
+
+### RTL 仿真 (xsim, 关键取证)
+- 建了 rtl_tcp_tb.v: 对综合网表喂 SYN→ACK→536B 数据段 (含 TLAST, 校验和正确写入)。
+- 单段与连续两段仿真: **472+64 回显帧内容逐字节正确** (payload RAM / RX buffer 全对)。
+- 过程中排除: 我的 TB 曾把校验和写进载荷前 2 字节 (95 fe) — 纯 TB bug, 已修。
+- 结论: IP 的 tail 版 RTL 本身正确 → 板上错位另有原因。
+
+### 板级时间线分析 (pk_tcp3)
+- 4 个回显帧在 26.7ms 内连发 (帧时长 ~4.3µs) → 客户端的数据段在 FPGA 发送上一帧时到达。
+- demo 1Hz 广播与回显帧无碰撞 (74ms 间隔) → demo 排除。
+- **根因: tcp_send 写 TX_UDP_BASE 未加 mac_tx_busy 门控 → 新 echo 构建覆盖在途帧**
+  (MAC 正在读 TX 区, 帧内容被混入后段数据, FCS 仍由 MAC 按实际字节计算 → PC 收帧但
+  TCP 校验和错 → 静默丢弃)。UDP 层早有此门控, TCP 漏了。
+
+### 修复 (busy-gated queue)
+- tcp_queue(): MAC 空闲且队列空 → 立即回显 (≤472) + 余量入队; MAC 忙/队列非空 → 整段入队。
+- 队列: 全局 BRAM tcp_send_bufs + 标量寄存器 (tcp_q_len/off/cid) — 顺序补发。
+- tcp_maintenance: 空闲时每 pass 发一块 (≤472)。
+- tcp_rx_process 增加 mac_busy 参数。csim 全过 (csim 的 256 节拍 HELLO 天然覆盖 busy 路径)。
+- 重建/烧录/板测进行中。
+
+## 2026-08-19 01:4x — busy-gated queue 首轮板测 (01:37 位流)
+- **TCP 1200B PASS** (connect 19ms echo 13ms), 300B PASS, UDP 2/2 ✓。
+- 2000B: 1 字节错位 (offset 1726, got C8 exp BE) — RTO 重传未门控 (会覆盖在途帧)。
+- 4096/8000B: 超时, 收 2144 = 旧队列容量 4×MSS → 队列溢出。
+- 修复: ① 队列扩到 16×MSS (8576B); ② RTO 重传改为 retrans_due 标志, 由 tcp_maintenance
+  (idle 门控) 执行。csim 全过。重建中。
+
+## 2026-08-19 02:4x — 决定性修复: 通告 MSS=460 (单帧回显, 绕开多段 RTL bug)
+
+### 02:09 位流板测 (busy-gated queue + 16×MSS + retrans_due)
+- TCP 1200B ✅ PASS (connect 18ms echo 11ms), 300B ✅。
+- 2000B: 最后一帧 (392B tail) 在偏移 112 处混入完整 PC ACK 帧字节 → Windows 校验和丢弃。
+- 4096/8000B: 卡在 2144 (=4×MSS 旧容量) — 队列未按 16×MSS 生效。
+- 步进 24B (6 word) 的错位 + 混入 PC ACK 帧 → 多段队列的 tcp_send_bufs 指针算术在 RTL
+  与 csim 分歧 (csim 全对, RTL 错)。
+
+### 架构决策 (避免继续在 RTL 调度 bug 上消耗)
+- **通告 MSS = 460** (≤ 单帧载荷上限 472): PC 严格按通告 MSS 分段, 每段单帧立即回显,
+  **完全不需要多段队列/重排**, 从根本上绕开 RTL 指针算术 bug。
+- 460+20(IP)+20(TCP) = 500 < 512 word 帧区上限。
+- 保留 busy-gated queue 作为 MAC 忙时的兜底 (单段入队, 几乎不用)。
+- TB 更新: SYN-ACK MSS=460 断言 + 2000B 五段 (460×4+160) 回显测试。csim 全过。
+- 重建/烧录/板测进行中。
+
+## 2026-08-19 03:0x — TCP 大载荷最终验证 (MSS=460 位流 02:41, agent 现场)
+
+### 环境确认
+- 位流: vivado_prj/udp_dual_phy1g2.runs/impl_1/wrapper_1g.bit (02:41, MSS=460 修复版) 已烧录。
+- ping 192.168.100.2 = 2/2 回复 0ms ✓, hw_server localhost:3121 运行中。
+- 目标: TCP 2000B (5 段) / 4096B (9 段) / 8000B (18 段) 大载荷 echo, 逐字节匹配。
+
+## 2026-08-19 03:5x — TCP 大载荷验证: MSS=460 被 Windows 无视, 需扩 RX+TX 双路径
+
+### 关键发现: Windows 无视通告 MSS=460
+- pktmon 证实 Windows 发送 536B TCP 段 (IP total 576), 完全无视 FPGA 的 MSS=460 通告。
+- 旧 RX payload[] 数组只有 460B 宽, 536B 段被截断 → echo 内容为 stale BRAM 数据。
+- 修复: TCP_RX_PAYLOAD 扩到 576B (layer_tcp.cpp 03:12), HLS 重综合 (03:16 udp_echo.v 255KB),
+  Vivado 重建 (03:30 BITSTREAM DONE), xsim RTL 仿真 (03:50, 2.7M ns)。
+
+### 板测结果 (03:30 位流, 03:53 烧录)
+| 测试 | 结果 |
+|------|------|
+| TCP 25B | ✅ PASS ("hello from ECO board test" 原样返回) |
+| TCP 2000B | ❌ 收到 1504B, 偏移 1112 处错位 (got 'Y' exp '6', 8 字节偏移) |
+| TCP 4096B | ❌ 收到 1648B, 同为偏移 1112 处错位 |
+| TCP 8000B | ❌ 收到 3296B, 同为偏移 1112 处错位 |
+
+### 根因分析
+- RX 方向已修 (能收 536B 段), 但 **TX 方向 TCP_TX_CHUNK 仍是 472B** (帧区 buffer 硬限制:
+  TX_UDP_BASE=word 384, 总 buffer 512 word, 512-384=128 word=512B, 减 IP+TCP 头 40B=472B)。
+- 每个 536B 段被 tcp_queue 拆成 472+64 两个 TX 帧, 但 tcp_maintenance 的剩余 chunk 刷新
+  在多段连续到达时出现错位 → 所有大载荷在 1112 字节处统一错位。
+- 1112 = 472×2 + 168 → 第 3 个 chunk 的第 168 字节处, 前 2 个 chunk 的 64B 尾段被
+  下一段的 chunk 覆盖/混入。
+
+### 下一轮修复方向
+- 选项 A: 调 buffer 布局让单帧装 536B 载荷 (需移动 TX_UDP_BASE 或扩大 buffer)
+- 选项 B: 修 tcp_maintenance 的多 chunk 刷新逻辑 (当前已实现但 64B 尾段在背靠背场景有 bug)
+- 选项 A 更干净, 消除多段队列根本不需要 — 536B 单帧直接 echo。
+- 当前 TCP 25B 小载荷可用, 大数据待修。
+

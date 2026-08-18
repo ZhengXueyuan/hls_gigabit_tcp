@@ -11,13 +11,35 @@
 #define MAX_TCP_CONN     3
 #endif
 
+// ARP lookup (defined in layer_arp.cpp — same translation unit).
+bool arp_lookup(arp_entry_t *table, ap_uint<32> ip, mac_addr_t &mac);
+
 #define TCP_PORT_ECHO    7
-#define TCP_MSS          536
+// FIX 2026-08-19: advertise MSS=460 so every peer data segment fits a single
+// 472-byte TX frame -> the echo is always immediate, no multi-chunk
+// re-assembly (the HLS RTL pointer-arithmetic for the queue diverged from
+// csim for multi-chunk backlog). 460+20+20 = 500 < 512 word limit.
+#define TCP_MSS          460
+#define TCP_SEND_BUF     (TCP_RX_PAYLOAD)
+// FIX 2026-08-18: the TX frame lives at TX_UDP_BASE (384); the region ends
+// at word 512. IP(5) + TCP(5) leaves 123 words = 492 bytes, so a payload
+// chunk must not exceed 472 bytes or the frame overruns the buffer.
+#define TCP_TX_CHUNK     472
+// FIX 2026-08-19 (agent): Windows IGNORES the advertised MSS=460 and sends
+// 536-byte segments (IP total 576) regardless. The old payload[] array was
+// TCP_MSS(460) wide with a fill guard `plen<=TCP_MSS`, so a 536B segment
+// left payload[] unpopulated (HLS compiled the guard to `(plen!=0 && plen<=460)
+// ? plen : 1` — one byte!) and the echo carried stale BRAM contents. Size the
+// RX payload buffer for the largest segment the peer can actually send
+// (536B) so echo data is always populated correctly.
+#define TCP_RX_PAYLOAD    576   // room for a full 536B segment + margin
 #define TCP_RTO_MIN      10000000   // ~80ms min RTO
 #define TCP_RTO_MAX      80000000   // ~640ms max RTO
 #define TCP_HEADER_BYTES 20
 #define TCP_MAX_HDR      28   // 20 base + 8 options (MSS+WS+NOP)
 #define TCP_BUF_BASE     (TX_SCRATCH_BASE + 16)
+#define TCP_ALPHA_SHIFT  3   // srtt weight = 1/8
+#define TCP_BETA_SHIFT   2   // rttvar weight = 1/4
 #define TCP_ALPHA_SHIFT  3   // srtt weight = 1/8
 #define TCP_BETA_SHIFT   2   // rttvar weight = 1/4
 
@@ -58,13 +80,10 @@ struct tcp_conn_t {
     uint16_t retrans_len;
     uint8_t  retrans_flags;
     bool     retrans_pending;
-    // Send buffer (echo data waiting to send)
-    uint8_t  send_buf[TCP_MSS];
-    uint16_t send_len;      // bytes queued for sending
-    uint16_t send_offset;   // next byte offset to send
 };
 static tcp_conn_t tcp_conn[MAX_TCP_CONN];
-static uint8_t    tcp_retrans_buf[MAX_TCP_CONN][TCP_MSS];  // BRAM
+static uint8_t    tcp_retrans_buf[MAX_TCP_CONN][TCP_RX_PAYLOAD];  // BRAM
+
 
 //=============================================================================
 // Helpers
@@ -157,15 +176,20 @@ static void tcp_send(uint32_t *buf, mac_tx_req_t &tx_req, int8_t cid,
                      uint8_t flags, const uint8_t *payload, uint16_t pay_len){
     if(cid<0||cid>=MAX_TCP_CONN)return;
     tcp_conn_t &c=tcp_conn[cid];
-    uint8_t seg[TCP_MAX_HDR+TCP_MSS];
-    uint16_t total=TCP_HEADER_BYTES+pay_len;
+    uint8_t seg[TCP_MAX_HDR+TCP_TX_CHUNK];
+    // FIX 2026-08-18: SYN and SYN-ACK segments carry the 8-byte options
+    // block (doff=7); total must include it or the options never reach the
+    // wire (segment shorter than the header claims -> malformed).
+    bool has_opts=(flags&TCP_SYN)!=0;
+    uint16_t total=(has_opts?TCP_MAX_HDR:TCP_HEADER_BYTES)+pay_len;
     uint32_t sip=(BOARD_IP_BYTE0<<24)|(BOARD_IP_BYTE1<<16)|(BOARD_IP_BYTE2<<8)|BOARD_IP_BYTE3;
-    tcp_build_hdr(seg,TCP_PORT_ECHO,c.peer_port,c.seq,c.peer_seq,flags,0xFFFF,(flags&TCP_SYN)&&!(flags&TCP_ACK));
+    tcp_build_hdr(seg,TCP_PORT_ECHO,c.peer_port,c.seq,c.peer_seq,flags,0xFFFF,has_opts);
     if(payload&&pay_len>0){for(int i=0;i<pay_len;i++)seg[TCP_HEADER_BYTES+i]=payload[i];}
     uint16_t cs=tcp_csum(sip,c.peer_ip,seg,total);seg[16]=(cs>>8)&0xFF;seg[17]=cs&0xFF;
-    for(int i=0;i<(total+3)/4;i++){uint32_t w=((uint32_t)seg[i*4]<<24)|((uint32_t)seg[i*4+1]<<16)|((uint32_t)seg[i*4+2]<<8)|seg[i*4+3];buf[TCP_BUF_BASE+i]=w;}
     // Update SEQ and flight size
-    if(pay_len>0||(flags&(TCP_SYN|TCP_FIN))){uint8_t inc=((flags&TCP_SYN)?1:0)+((flags&TCP_FIN)?1:0)+pay_len;c.seq+=inc;c.flight_size+=inc;}
+    // FIX 2026-08-18: inc was uint8_t — payloads >=256 bytes truncated the
+    // sequence advance (472 -> 216), desyncing the connection.
+    if(pay_len>0||(flags&(TCP_SYN|TCP_FIN))){uint32_t inc=((flags&TCP_SYN)?1:0)+((flags&TCP_FIN)?1:0)+pay_len;c.seq+=inc;c.flight_size+=inc;}
     // IP header
     int ipb=TX_UDP_BASE;uint16_t ipt=20+total;uint8_t ip[20];
     ip[0]=0x45;ip[1]=0;ip[2]=(ipt>>8)&0xFF;ip[3]=ipt&0xFF;ip[4]=0;ip[5]=0;ip[6]=0x40;ip[7]=0;
@@ -175,36 +199,101 @@ static void tcp_send(uint32_t *buf, mac_tx_req_t &tx_req, int8_t cid,
     uint16_t iw[10];for(int i=0;i<10;i++)iw[i]=((uint16_t)ip[i*2]<<8)|ip[i*2+1];
     uint16_t ic=ones_complement_checksum(iw,10);ip[10]=(ic>>8)&0xFF;ip[11]=ic&0xFF;
     for(int i=0;i<5;i++)buf[ipb+i]=((uint32_t)ip[i*4]<<24)|((uint32_t)ip[i*4+1]<<16)|((uint32_t)ip[i*4+2]<<8)|ip[i*4+3];
-    for(int i=0;i<(total+3)/4;i++)buf[ipb+5+i]=buf[TCP_BUF_BASE+i];
+    // FIX 2026-08-18: write the segment DIRECTLY at ipb+5. The previous
+    // TCP_BUF_BASE staging + copy hop was doubly broken: the source range
+    // (TCP_BUF_BASE=272 .. +123 words = 394) overlaps BOTH the destination
+    // region (ipb+5=389) and the IP header location (ipb=384..388), so large
+    // segments copied the freshly-written IP header into the payload.
+    for(int i=0;i<(total+3)/4;i++){
+        uint32_t w=((uint32_t)seg[i*4]<<24)|((uint32_t)seg[i*4+1]<<16)|((uint32_t)seg[i*4+2]<<8)|seg[i*4+3];
+        buf[ipb+5+i]=w;
+    }
     // Retransmit save
     if(flags&TCP_SYN){c.retrans_flags=flags;c.retrans_len=0;c.retrans_pending=true;c.rto_timer=0;}
     else if(pay_len>0){c.retrans_flags=flags;c.retrans_len=pay_len;c.retrans_pending=true;c.rto_timer=0;for(int i=0;i<pay_len;i++)tcp_retrans_buf[cid][i]=payload[i];}
     // RTT measurement
     if(pay_len>0&&c.rtt_seq==0){c.rtt_seq=c.seq-pay_len;c.rtt_start=0;/* timer reset */}
-    tx_req.dst_mac=0xFFFFFFFFFFFFULL;tx_req.ethertype=ETHERTYPE_IPV4;tx_req.buf_addr=ipb;tx_req.buf_len=ipt;tx_req.request=true;
+    // FIX 2026-08-18: unicast to the peer when known (ARP cache), like ICMP;
+    // broadcast fallback otherwise.
+    mac_addr_t reply_mac=0xFFFFFFFFFFFFULL;
+    if(arp_lookup(NULL,c.peer_ip,reply_mac)){}
+    tx_req.dst_mac=reply_mac;tx_req.ethertype=ETHERTYPE_IPV4;tx_req.buf_addr=ipb;tx_req.buf_len=ipt;tx_req.request=true;
 }
 
 //=============================================================================
-// Try to send queued data from send buffer (up to cwnd limit)
+// Echo segment -> TX frame (busy-gated queue, FIX 2026-08-19)
 //=============================================================================
-static void tcp_flush_send(uint32_t *buf, mac_tx_req_t &tx_req, int8_t cid){
-    tcp_conn_t &c=tcp_conn[cid];
-    while(c.send_len>c.send_offset){
-        uint32_t allowed=(c.cwnd>c.flight_size)?(c.cwnd-c.flight_size):0;
-        if(allowed<TCP_MSS)break; // can't send yet (congestion window full)
-        uint16_t chunk=(c.send_len-c.send_offset>TCP_MSS)?TCP_MSS:(c.send_len-c.send_offset);
-        tcp_send(buf,tx_req,cid,TCP_ACK,c.send_buf+c.send_offset,chunk);
-        c.send_offset+=chunk;
-        if(chunk<TCP_MSS)break;
+// The MAC TX is single-buffered: the shared TX region (TX_UDP_BASE) is read
+// by the MAC while a frame is in flight, so an echo build that runs during
+// the transmission clobbers the in-flight frame (observed on the board: a
+// burst of echo frames got mixed segment contents and were FCS-dropped).
+//   * when the MAC is idle: the echo is built IMMEDIATELY in the same pass;
+//   * when the MAC is busy: the payload is parked in a queue (global BRAM +
+//     scalar register state) and sent by tcp_maintenance on an idle pass,
+//     one chunk per pass, in order.
+//=============================================================================
+static uint8_t  tcp_send_bufs[MAX_TCP_CONN][TCP_RX_PAYLOAD]; // BRAM
+static bool     tcp_retrans_due = false;  // idle-gated RTO retransmission
+static int8_t   tcp_retrans_cid = 0;
+static uint16_t tcp_q_len = 0;     // bytes queued (send_bufs[cid][0..len-1])
+static uint16_t tcp_q_off = 0;     // next byte to send
+static int8_t   tcp_q_cid = 0;     // connection owning the queue
+
+static void tcp_queue(uint32_t *buf, mac_tx_req_t &tx_req, int8_t cid,
+                      const uint8_t *payload, uint16_t pay_len,
+                      bool mac_busy){
+    if(cid<0||cid>=MAX_TCP_CONN||pay_len==0)return;
+    // Can we send immediately? (MAC idle, nothing queued, TX free)
+    if(!mac_busy && !tx_req.request && tcp_q_len==tcp_q_off){
+        uint16_t first=(pay_len>TCP_TX_CHUNK)?TCP_TX_CHUNK:pay_len;
+        tcp_send(buf,tx_req,cid,TCP_ACK,payload,first);
+        if(pay_len>first){
+            uint16_t rem=pay_len-first;
+            if(rem>TCP_SEND_BUF)rem=TCP_SEND_BUF;
+            for(int i=0;i<rem;i++)tcp_send_bufs[cid][i]=payload[first+i];
+            tcp_q_len=rem;tcp_q_off=0;tcp_q_cid=cid;
+        }
+        return;
     }
-    if(c.send_offset>=c.send_len){c.send_len=0;c.send_offset=0;} // all sent
+    // MAC busy or queue non-empty: park the whole payload in the queue
+    if(tcp_q_len==tcp_q_off){tcp_q_len=0;tcp_q_off=0;tcp_q_cid=cid;}
+    uint16_t room=TCP_SEND_BUF-tcp_q_len;
+    if(room>pay_len)room=pay_len;
+    for(int i=0;i<room;i++)tcp_send_bufs[cid][tcp_q_len+i]=payload[i];
+    tcp_q_len+=room;
+}
+
+//=============================================================================
+// TCP maintenance: flush the echo queue whenever the MAC is idle
+//=============================================================================
+// Called every pass from the top level (when !tx_req.request && !tx_busy).
+// Sends at most ONE chunk per pass.
+//=============================================================================
+static void tcp_maintenance(uint32_t *buf, mac_tx_req_t &tx_req){
+    if(tcp_retrans_due&&!tx_req.request){
+        int8_t i=tcp_retrans_cid;
+        tcp_conn_t &c=tcp_conn[i];
+        if(c.state==T_SYN_RCVD)tcp_send(buf,tx_req,i,TCP_SYN|TCP_ACK,NULL,0);
+        else if(c.state==T_ESTABLISHED&&c.retrans_len>0)tcp_send(buf,tx_req,i,TCP_ACK,tcp_retrans_buf[i],c.retrans_len);
+        else if(c.state==T_LAST_ACK)tcp_send(buf,tx_req,i,TCP_FIN|TCP_ACK,NULL,0);
+        tcp_retrans_due=false;
+        return;
+    }
+    if(tcp_q_len>tcp_q_off&&!tx_req.request){
+        uint16_t rem=tcp_q_len-tcp_q_off;
+        uint16_t chunk=(rem>TCP_TX_CHUNK)?TCP_TX_CHUNK:rem;
+        tcp_send(buf,tx_req,tcp_q_cid,TCP_ACK,tcp_send_bufs[tcp_q_cid]+tcp_q_off,chunk);
+        tcp_q_off+=chunk;
+        if(tcp_q_off>=tcp_q_len){tcp_q_len=0;tcp_q_off=0;}
+    }
 }
 
 //=============================================================================
 // TCP RX processing
 //=============================================================================
-static void tcp_rx_process(bool rst, ip_rx_t &ip_rx, uint32_t *buf, mac_tx_req_t &tx_req){
+static void tcp_rx_process(bool rst, ip_rx_t &ip_rx, uint32_t *buf, mac_tx_req_t &tx_req, bool mac_busy){
     #pragma HLS RESOURCE variable=tcp_retrans_buf core=RAM_2P_BRAM
+    #pragma HLS RESOURCE variable=tcp_send_bufs core=RAM_2P_BRAM
     #pragma HLS RESOURCE variable=tcp_conn core=RAM_2P_BRAM
     if(!rst){for(int i=0;i<MAX_TCP_CONN;i++)tcp_conn[i].state=T_FREE;return;}
     // Retransmission + send flush scan
@@ -212,7 +301,11 @@ static void tcp_rx_process(bool rst, ip_rx_t &ip_rx, uint32_t *buf, mac_tx_req_t
         for(int i=0;i<MAX_TCP_CONN;i++){
             #pragma HLS UNROLL
             tcp_conn_t &c=tcp_conn[i];
-            // RTO retransmission
+            // RTO retransmission.
+            // FIX 2026-08-19: do NOT call tcp_send here — the MAC may be
+            // mid-send (reading TX_UDP_BASE); a retransmit would clobber the
+            // in-flight frame. Mark the retransmission due; tcp_maintenance
+            // (idle-gated) performs it.
             if(c.retrans_pending){
                 c.rto_timer++;
                 if(c.rto_timer>=c.rto){
@@ -223,15 +316,12 @@ static void tcp_rx_process(bool rst, ip_rx_t &ip_rx, uint32_t *buf, mac_tx_req_t
                     c.cwnd=TCP_MSS; // collapse cwnd on timeout
                     c.flight_size=0;
                     c.dup_ack_cnt=0;
-                    if(c.state==T_SYN_RCVD)tcp_send(buf,tx_req,i,TCP_SYN|TCP_ACK,NULL,0);
-                    else if(c.state==T_ESTABLISHED&&c.retrans_len>0)tcp_send(buf,tx_req,i,TCP_ACK,tcp_retrans_buf[i],c.retrans_len);
-                    else if(c.state==T_LAST_ACK)tcp_send(buf,tx_req,i,TCP_FIN|TCP_ACK,NULL,0);
+                    tcp_retrans_due=true;
+                    tcp_retrans_cid=i;
                 }
             }
-            // Flush send buffer (congestion window may allow sending now)
-            if(c.state==T_ESTABLISHED&&c.send_len>0&&!tx_req.request){
-                tcp_flush_send(buf,tx_req,i);
-            }
+            // The echo queue is flushed by tcp_maintenance (called every
+            // idle pass from the top level), so no send here.
         }
         return;
     }
@@ -245,21 +335,34 @@ static void tcp_rx_process(bool rst, ip_rx_t &ip_rx, uint32_t *buf, mac_tx_req_t
     uint16_t wnd=((uint16_t)th[14]<<8)|th[15];
     uint16_t tlen=ip_rx.total_len-IP_HEADER_BYTES,plen=tlen-(doff*4);
     if(dp!=TCP_PORT_ECHO)return;
-    // Read payload
-    uint8_t payload[TCP_MSS];
-    if(plen>0&&plen<=TCP_MSS){int ps=tb+doff;for(int i=0;i<plen;i++){uint8_t wi=ps+(i>>2),bi=i&0x3;payload[i]=(buf[wi]>>((3-bi)*8))&0xFF;}}
+    // Read payload. FIX 2026-08-19: sized TCP_RX_PAYLOAD (576) and populated
+    // for any plen up to that — a peer that ignores MSS=460 sends 536B
+    // segments, which the old TCP_MSS(460)-wide buffer silently dropped.
+    uint8_t payload[TCP_RX_PAYLOAD];
+    if(plen>0&&plen<=TCP_RX_PAYLOAD){int ps=tb+doff;for(int i=0;i<plen;i++){uint8_t wi=ps+(i>>2),bi=i&0x3;payload[i]=(buf[wi]>>((3-bi)*8))&0xFF;}}
     int8_t cid=tcp_find(sp,ip_rx.src_ip);
-    // New connection
-    if(cid<0&&(flags&TCP_SYN)&&!(flags&TCP_ACK)){cid=tcp_find(0,0);if(cid<0)return;
+    // FIX 2026-08-18: tcp_find() returns a free slot index (>=0) when no
+    // connection matches, so the old `cid<0` test was never true and every
+    // SYN was dropped (new-connection init skipped -> T_FREE -> return).
+    // A new connection is a free slot carrying a SYN.
+    if(cid>=0&&tcp_conn[cid].state==T_FREE&&(flags&TCP_SYN)&&!(flags&TCP_ACK)){
         tcp_conn_t &c=tcp_conn[cid];c.state=T_LISTEN;c.cwnd=TCP_MSS;c.ssthresh=65535;
         c.srtt=0;c.rttvar=0;c.rto=TCP_RTO_MIN;c.dup_ack_cnt=0;c.seq=0x12345678|(cid<<20);c.peer_seq=0;c.last_ack_recv=0;c.flight_size=0;
         c.peer_mss=TCP_MSS;c.peer_wscale=0;c.our_wscale=7;
-        // Parse MSS/WS options from SYN (bytes 20+ of TCP header)
+        // Parse MSS/WS options from SYN (bytes 20+ of TCP header).
+        // FIX 2026-08-18: read the option bytes from the RX buffer, not from
+        // th[] (only 20 bytes were loaded -> out-of-bounds reads gave garbage
+        // MSS/window-scale). Clamp the window scale to 0..7 (RFC 7323).
         if(doff>5){uint8_t opt_end=(doff-5)*4;for(int o=0;o+1<opt_end;){
-            uint8_t k=th[20+o];if(k==0)break;if(k==1){o++;continue;}
-            if(o+1>=opt_end)break;uint8_t ln=th[20+o+1];if(ln<2)break;
-            if(k==2&&ln>=4)c.peer_mss=((uint16_t)th[20+o+2]<<8)|th[20+o+3];
-            else if(k==3&&ln>=3)c.peer_wscale=th[20+o+2];
+            int obw=(tb*4+20+o)>>2;uint8_t obi=(tb*4+20+o)&3;
+            uint8_t k=(buf[obw]>>((3-obi)*8))&0xFF;if(k==0)break;if(k==1){o++;continue;}
+            if(o+1>=opt_end)break;
+            int lbw=(tb*4+20+o+1)>>2;uint8_t lbi=(tb*4+20+o+1)&3;
+            uint8_t ln=(buf[lbw]>>((3-lbi)*8))&0xFF;if(ln<2)break;
+            if(k==2&&ln>=4){int mw=(tb*4+20+o+2)>>2;uint8_t mi=(tb*4+20+o+2)&3;
+                c.peer_mss=(((uint16_t)((buf[mw]>>((3-mi)*8))&0xFF)<<8)|((buf[(tb*4+20+o+3)>>2]>>((3-((tb*4+20+o+3)&3))*8))&0xFF));}
+            else if(k==3&&ln>=3){int ww=(tb*4+20+o+2)>>2;uint8_t wi=(tb*4+20+o+2)&3;
+                uint8_t ws=(buf[ww]>>((3-wi)*8))&0xFF;c.peer_wscale=(ws<=7)?ws:0;}
             o+=ln;
         }}
         // Adjust cwnd to peer's MSS if smaller
@@ -275,10 +378,10 @@ static void tcp_rx_process(bool rst, ip_rx_t &ip_rx, uint32_t *buf, mac_tx_req_t
         case T_ESTABLISHED:
             c.peer_seq=seq+plen;if(flags&TCP_FIN)c.peer_seq++;
             if(plen>0){
-                // Queue echo data
-                for(int i=0;i<plen&&i<TCP_MSS;i++)c.send_buf[c.send_len+i]=payload[i];
-                c.send_len+=plen;c.send_offset=0;
-                tcp_flush_send(buf,tx_req,cid);
+                // Echo via the busy-gated queue: immediate when the MAC is
+                // idle, parked otherwise (the MAC must never be writing the
+                // TX region while it is being read by an in-flight frame).
+                tcp_queue(buf,tx_req,cid,payload,plen,mac_busy);
             }else if(flags&TCP_ACK)c.retrans_pending=false;
             if(flags&TCP_FIN){tcp_send(buf,tx_req,cid,TCP_FIN|TCP_ACK,NULL,0);c.state=T_LAST_ACK;}break;
         case T_LAST_ACK:if(flags&TCP_ACK){c.retrans_pending=false;c.state=T_FREE;}break;

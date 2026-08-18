@@ -168,7 +168,9 @@ static void mac_tx_process(
     bool                      reset_n,
     mac_tx_req_t             &tx_req,
     uint32_t                 *buffer,
-    hls::stream<gmii_byte_t> &tx_stream
+    hls::stream<gmii_byte_t> &tx_stream,
+    bool                     &tx_busy        // out: MAC is (or is about to
+                                             // be) reading the shared buffer
 ) {
     static uint8_t  state         = MAC_TX_IDLE;
     static uint8_t  byte_cnt      = 0;
@@ -181,12 +183,18 @@ static void mac_tx_process(
     static bool        do_vlan    = false;
     static ap_uint<16> vlan_tci   = 0;
 
+    // FIX 2026-08-18: frame builders (UDP/TCP write the TX buffer while the
+    // MAC may be streaming a frame from it). Expose "MAC busy" so builders
+    // only touch the buffer when no frame is being sent/queued.
+    tx_busy = (state != MAC_TX_IDLE) || tx_req.request;
+
     if (!reset_n) {
         state      = MAC_TX_IDLE;
         byte_cnt   = 0;
         sent_bytes = 0;
         crc_reg    = 0xFFFFFFFF;
         tx_req.request = false;
+        tx_busy    = false;
         return;
     }
 

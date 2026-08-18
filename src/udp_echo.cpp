@@ -56,6 +56,8 @@ void udp_echo(
     static bool     data_received = false;
     static uint16_t rx_udp_len    = 0;
     static uint16_t rx_ip_len     = 0;
+    static uint16_t rx_src_port   = 0;
+    static ap_uint<32> rx_src_ip  = 0;
     static bool     init_done     = false;
 
     // DHCP state (Phase 5)
@@ -75,6 +77,8 @@ void udp_echo(
         data_received  = false;
         rx_udp_len     = 0;
         rx_ip_len      = 0;
+        rx_src_port    = 0;
+        rx_src_ip      = 0;
         init_done      = false;
         dhcp_state     = DHCP_IDLE;
         dhcp_xid       = 0;
@@ -102,8 +106,9 @@ void udp_echo(
     }
 
     // Always call layers (they handle reset internally)
+    bool mac_tx_busy = false;
     mac_rx_process(reset_n, rx_stream, buffer, mac_rx);
-    mac_tx_process(reset_n, tx_req, buffer, tx_stream);
+    mac_tx_process(reset_n, tx_req, buffer, tx_stream, mac_tx_busy);
 
     ip_rx.valid = false;
     udp_rx.valid = false;
@@ -119,7 +124,7 @@ void udp_echo(
                 } else if (ip_rx.protocol == IP_PROTO_IGMP) {
                     igmp_rx_process(reset_n, ip_rx, buffer, tx_req);
                 } else if (ip_rx.protocol == IP_PROTO_TCP) {
-                    tcp_rx_process(reset_n, ip_rx, buffer, tx_req);
+                    tcp_rx_process(reset_n, ip_rx, buffer, tx_req, mac_tx_busy);
                 } else if (ip_rx.protocol == IP_PROTO_UDP) {
                     udp_rx_process(reset_n, ip_rx, buffer, udp_rx);
                     if (udp_rx.valid) {
@@ -139,6 +144,8 @@ void udp_echo(
                             data_received = true;
                             rx_udp_len    = udp_rx.length;
                             rx_ip_len     = ip_rx.total_len;
+                            rx_src_port   = udp_rx.src_port;
+                            rx_src_ip     = ip_rx.src_ip;
                         }
                     }
                 }
@@ -152,12 +159,22 @@ void udp_echo(
                        dhcp_xid, dhcp_offered, dhcp_server, dhcp_timer);
     }
 
-    // TX arbitration: UDP periodic
-    if (!tx_req.request) {
-        udp_tx_process(reset_n, buffer, tx_req, NULL, data_received, rx_udp_len, rx_ip_len);
-    }
-    if (data_received && tx_req.request) {
+    // TX arbitration: UDP echo (immediate) + periodic HELLO.
+    // udp_tx_process consumes data_received whenever it runs (immediate
+    // echo), so it is safe to clear the flag right after the call. When the
+    // MAC TX is busy (a frame is being sent/queued and the MAC would read
+    // the same buffer region) the call is skipped and the flag survives
+    // until the next pass — this prevents the builder from clobbering a
+    // frame mid-send.
+    if (!tx_req.request && !mac_tx_busy) {
+        udp_tx_process(reset_n, buffer, tx_req, NULL,
+                       data_received, rx_udp_len, rx_ip_len, rx_src_port, rx_src_ip);
         data_received = false;
+    }
+
+    // TCP maintenance: flush queued echo data whenever the MAC is idle
+    if (!tx_req.request && !mac_tx_busy) {
+        tcp_maintenance(buffer, tx_req);
     }
 
     // Statistics tracking + periodic report
