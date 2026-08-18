@@ -278,10 +278,13 @@ static void mac_tx_process(
             {
                 uint32_t fcs = crc_reg ^ 0xFFFFFFFF;
                 uint8_t bd;
-                if (byte_cnt == 0)      bd = (fcs >> 24) & 0xFF;
-                else if (byte_cnt == 1) bd = (fcs >> 16) & 0xFF;
-                else if (byte_cnt == 2) bd = (fcs >> 8) & 0xFF;
-                else                    bd = fcs & 0xFF;
+                // FIX 2026-08-18: FCS bytes LSB-first (byte0 = fcs[7:0]) to
+                // match this board's PHY/PC chain (k720 demo emits CA A3 F9 63;
+                // MSB-first FCS is silently dropped by the PC NIC).
+                if (byte_cnt == 0)      bd = fcs & 0xFF;
+                else if (byte_cnt == 1) bd = (fcs >> 8) & 0xFF;
+                else if (byte_cnt == 2) bd = (fcs >> 16) & 0xFF;
+                else                    bd = (fcs >> 24) & 0xFF;
 
                 bool is_last = (byte_cnt == 3);
                 gmii_byte_t b; b.data = bd; b.last = is_last;

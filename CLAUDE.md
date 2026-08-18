@@ -8,12 +8,16 @@ perfv `udp_hls` HLS 网络协议栈移植到 ECO 板 (XC7K325T-2FFG676C) 的副�
 ## 当前状态 (2026-08-18)
 
 - ✅ UART console 板级通 (`?mac ?ip ?stat`), RX 通路逐字节验证完美
-- ✅ 协议栈 4 个 C++ bug 已修并重新综合 (03:45): MAC padding (runt) / DHCP 帧结构 /
-  DHCP 洪泛 / wrapper rx_last 极性。csim 14 项全过。
-- 🔧 **唯一遗留: FPGA TX 帧到不了 PC (pktmon 零包)**。已破案: demo 克隆生成器
-  eth_crc32 用 unreflected CRC → 线上 FCS 位反转 → 网卡静默丢。修复 (0xEDB88320
-  reflected) 已应用, 板级复核中 (agent 任务 #14 在跑, 别重复派活)。
-- ⬜ 端到端验证: ping → UDP 8080 → TCP 7 (TX 打通后)
+- ✅ 协议栈 4 个 C++ bug 已修并重新综合: MAC padding (runt) / DHCP 帧结构 /
+  DHCP 洪泛 / wrapper rx_last 极性。csim 全过。
+- ✅ **TX 已打通** (2026-08-18 破案): 根因 = FCS **字节序必须 LSB-first**
+  (demo 帧线上 FCS = CA A3 F9 63 = zlib 寄存器 0x63F9A3CA 小端; 之前发的 63 F9 A3 CA
+  被网卡静默丢)。修复 = reflected CRC-32 (0xEDB88320) + 按 fcs[7:0],[15:8],[23:16],[31:24]
+  发出, 已应用到全部 7 个 Verilog 生成器 + HLS layer_mac.cpp。wrapper_min 板级验证:
+  pktmon 25s = 25 帧 FPGA ARP ✓ (与 demo 逐字节一致)。
+- 🔄 进行中 (agent 任务 #14): HLS IP 重综合 + wrapper_1g (ip_enable=1) 重建 →
+  烧录 → 端到端 ping → UDP 8080 → TCP 7 全链验证。
+- ⬜ 端到端验证: ping → UDP 8080 → TCP 7 (任务 #12)
 
 ## 工程结构
 
@@ -45,11 +49,14 @@ vivado -mode batch -source program_eco.tcl -tclargs <bit 路径>   # 烧录 JTAG
 ## 本工程特有坑 (教训)
 
 1. **网卡静默丢弃三原因**: runt <64B / FCS 错 / 字节错位 — FCS 错最容易在"自己验证自己"
-   的闭环里漏掉 (生成器 CRC 与校验方同源)。对照实验的"同一帧"必须字节级比对 FCS。
-2. HLS IP 是 call-based: TVALID 帧内空洞、TREADY 仅外层 FSM 拉高 → wrapper 必须用
+   的闭环里漏掉 (生成器 CRC 与校验方同源)。对照实验的"同一帧"必须**全帧逐字节**比对 FCS
+   (之前只比前 24 字节, 漏掉了 FCS 字节序)。
+2. **FCS 字节序铁律**: 本板 PHY/PC 链只接受 LSB-first 线上字节序 (demo 帧 = CA A3 F9 63)。
+   FCS 的"标准"有实现歧义 — 以权威 demo 位流的线上字节为基准, 不要自证。
+3. HLS IP 是 call-based: TVALID 帧内空洞、TREADY 仅外层 FSM 拉高 → wrapper 必须用
    FIFO 整帧缓冲桥 (TX 2048×9, TLAST=TDATA[8], ≥12 周期 IFG)。
-3. k720 工程的"实际" ethernet_test ≠ src/ 树 (工程版带 gmii_arbi+mac_test+6 个 Xilinx IP),
+4. k720 工程的"实际" ethernet_test ≠ src/ 树 (工程版带 gmii_arbi+mac_test+6 个 Xilinx IP),
    对照位流按工程版还原。
-4. ODDR 的 Q 只能接 OBUF/port — 想在 ODDR 输出采样 pad 电平要用 IOBUF (T=0)。
-5. 功率门控实验若把 IP 复位 (ip_enable=0), 其 TX regslice 会打垃圾帧污染线上 TXEN —
+5. ODDR 的 Q 只能接 OBUF/port — 想在 ODDR 输出采样 pad 电平要用 IOBUF (T=0)。
+6. 功率门控实验若把 IP 复位 (ip_enable=0), 其 TX regslice 会打垃圾帧污染线上 TXEN —
    必须同时门控 tx_push; 且 Vivado 会把常复位 IP 优化掉 (利用率失真)。

@@ -668,3 +668,66 @@ end
    不通 → 生成器帧在任何结构下都物理失败 (回到 TXC/PHY 层)。
 2. IOBUF 版 pin sampler 并行准备 (真实 pad 电平观测)。
 3. 两路结论出来后: wrapper_1g 恢复 ip_enable=1 重建 → ping/UDP 8080/TCP 7 全链验证。
+
+## 2026-08-18 上午续 — FCS 修复后仍 0 帧: 矩阵收窄到"帧源逻辑"或"gmii_clk 相位"
+
+### 修正 FCS 后的实验矩阵 (全部板级 pktmon)
+| 位流 | TX 源 | FCS | 结果 |
+|---|---|---|---|
+| demo 原版 (2019.2) | mac_test | 对 | ✓ 22帧/20s |
+| demo_rebuild (2025.2) | mac_test | 对 | ✓ 25帧/25s |
+| demo_rebuild + 约束 | mac_test | 对 | ✓ 25帧/25s |
+| demogen (demo top) | demo_clone | 错(旧) | ✗ 0 |
+| demogen (demo top) | demo_clone | 对(新) | ✗ 0 (pk18) |
+| wrapper_min | demo_clone 组合 | 对(新) | ✗ 0 (pk16) |
+| wrapper_min_reg | demo_clone 寄存 | 对(新) | ✗ 0 (pk17) |
+
+### 关键验证
+- **xsim 线级验证 (wrapper_min_tb)**: 修正 FCS 后线上帧逐字节完美 — 55×7 D5 FF×6 00 0A 35 01
+  FE C0 08 06 00 01..., 72B, FCS=63f9a3ca CORRECT (独立 zlib 参考)。wire 上低 nibble 在前
+  (RGMII 标准), TB 重建需 {fall,rise} 拼字节; 帧首字节因 TXCTL 检测滞后被捕获逻辑跳 1 字节
+  (模拟问题, 非设计问题)。
+- **demo_rebuild 同款 xsim**: 线上流与 demo_clone 逐字节一致 (55×6+D5+FF×6+00 0A 35...)。
+- **I/O 属性逐项对比**: IOSTANDARD/SLEW/DRIVE/IN_TERM/PULLUP/PULLDOWN/OFFCHIP_TERM
+  (FP_VTT_50)/CFGBVS/CONFIG 全同。
+- **时序**: 两设计 ODDR D1/D2 slack 同为 ~6.6-7ns; 生成器→util 输入路径 5.5ns; WNS 全绿。
+
+### 结论
+- 帧内容/FCS/结构 (组合vs寄存)/约束/工具链 (2025.2)/I/O 配置 全部排除。
+- 剩余假设: **gmii_clk 相位** (TXC/TXD 整体相对 PHY 的 RXC-关联 TX 时钟的相位, 每个 build
+  由 LUT1 反相器摆放决定, 固定不变) — 这是唯一未被控制的逐 build 变量。
+  (论证: 1000BASE-T 从机 PHY 的 TX PCS 时钟源自恢复时钟 ≈ RXC, TXC=~RXC+固定延迟,
+  相位不漂移 → 相位差能造成"此 build 永死, 彼 build 永活"。)
+
+### 进行中: 相位扫描实验 (udp_phsweep)
+- wrapper_min_phsweep.v: RXC 路径插入 VARIABLE IDELAYE2 (组 "idelay", 200MHz 参考),
+  2Hz 自动扫 tap 0..31 (每 tap ≈78ps, 全程 ~2.5ns), ?net 的 R 字段报当前 tap。
+- 若某 tap 出现 FPGA 帧 → 相位实锤, 再用固定值复现。
+- 失败则回到: 帧源逻辑本身的物理差异 (TXC/TXD 沿与数据时序的亚级差, 只能示波器/换板)。
+
+## 2026-08-18 上午 ★★★ 最终破案: FCS 字节序必须 LSB-first (演示帧 = zlib 寄存器小端)
+
+### 决定性发现 (全帧比对)
+- wrapper_min_tb 与 demo_tb 两个 xsim 都打印完整 72B 帧后逐字节对比:
+  - demo (能通, pk12/13/14): 线上 FCS = **CA A3 F9 63** (= zlib 寄存器 0x63F9A3CA 小端输出)
+  - demo_clone 修 1 (反多项式, MSB-first): **63 F9 A3 CA** → 板级 0 帧 (pk16/17/18)
+  - demo_clone 旧 (unreflected, MSB-first): 21 27 D6 68 → 板级 0 帧
+- **PC 的 NIC 只接受 LSB-first FCS 字节序** (演示帧通过 = 实证)。其余字节/内容/结构逐字节相同。
+- 解释: RTL8211E (或 NIC 链路) 对该帧的合法 FCS = 寄存器小端序; demo 板商代码按此设计。
+  标准 (MSB-first) 帧被网卡静默丢弃 → 之前的全部实验 (demo 克隆系列) 都被这一个字节序杀死。
+- 修复 (已应用到全部 7 个生成器 + HLS IP):
+  ```verilog
+  (idx==68) ? fcs[7:0] : (idx==69) ? fcs[15:8] : (idx==70) ? fcs[23:16] : fcs[31:24]
+  ```
+  HLS layer_mac.cpp: bd = fcs&0xFF, (fcs>>8), (fcs>>16), (fcs>>24); TB/rtl_sim_tb 同步改读取序。
+
+### 板级验证 (pk21) ✅✅✅
+- wrapper_min (LSB-first FCS) 烧录 → pktmon 25s = **25 个 FPGA ARP 帧 (00:0A:35:01:FE:C0,
+  who-has 192.168.0.3, 60B)** — PC 首次收到我们的帧!
+- 该帧与 demo 位流的帧逐字节一致 (含 FCS CA A3 F9 63)。
+
+### 进行中
+- HLS IP (layer_mac.cpp) FCS 序修复 → csim+csynth+export 重跑中 → wrapper_1g (ip_enable=1)
+  重建 → ping / UDP 8080 / TCP 7 全链验证。
+- 教训: ① FCS 的"标准"有实现歧义, 必须以板级/权威 demo 的线上字节为基准, 不能以自己
+  的参考实现自证; ② 全帧逐字节对比 (含 FCS) 才是对照实验的正确姿势 — 之前只比了前 24 字节。

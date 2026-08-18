@@ -301,11 +301,13 @@ Buffer + ARP 表均通过 `#pragma HLS RESOURCE core=RAM_2P_BRAM` 推断为双�
 | DHCP 帧缺 IP 头 + 缓冲越界 | DHCP 无法完成 DORA | DHCP 帧布局未含 IPv4 头, 写入越界 | 新布局 DHCP_FRAME_BASE=word 288, 82 words; 完整 IPv4 头 (0x45 00, csum 0x39A6) |
 | DHCP 无限洪泛 | ~134ms/次重发刷屏 | 失败路径无退避, retry 立即重来 | DHCP_FAILED(6) 状态 + retry_cnt 复位 |
 | wrapper rx_last_in 极性反 | IP 永不 complete 帧 | dv 上升沿被误当帧尾 | `rx_dv_d2 && !rx_dv_d1` (下降沿) 并 push rx_d2 |
-| demo 克隆生成器 FCS 位序错 | **所有 demo 克隆实验的帧被网卡当 FCS 错静默丢弃** | eth_crc32 用 unreflected MSB-first CRC → 线上 FCS 位反转 (21 27 d6 68 vs 正确 63 f9 a3 ca) | 标准 reflected CRC-32 (0xEDB88320), 终值取反后 MSB-first 上线 |
+| demo 克隆生成器 FCS 错 (双重) | **所有 demo 克隆实验的帧被网卡当 FCS 错静默丢弃** (pktmon 零包) | ① eth_crc32 用 unreflected MSB-first CRC (线上 21 27 d6 68) ② 修复后又用 MSB-first 字节序 (线上 63 F9 A3 CA) — 本板 PHY/PC 链只接受 LSB-first | reflected CRC-32 (0xEDB88320) + 按 fcs[7:0],[15:8],[23:16],[31:24] 发出 (线上 CA A3 F9 63 = demo 帧字节)。板级验证 pk21 = 25 帧 ✓ |
 
-> **教训**: 网卡静默丢弃 (pktmon 零包) 的三大原因: runt <64B、FCS 错、字节错位。
-> FCS 错最容易在"自己验证自己"的闭环里漏掉 — 生成器 CRC 与校验方同源时, 必须拿
-> zlib/802.3 权威值做字节级比对。对照实验的"同一帧"要连 FCS 一起比对。
+> **教训 (FCS 铁律)**: 网卡静默丢弃 (pktmon 零包) 的三大原因: runt <64B、FCS 错、字节错位。
+> FCS 的"标准"有实现歧义 (多项式 AND 线上字节序) — "自己验证自己"的闭环 (生成器 CRC 与
+> 校验方同源) 两重都漏掉过。**必须以权威 demo 位流的线上字节为基准做全帧逐字节比对**
+> (之前只比前 24 字节, 恰好漏掉 FCS 字段)。本板 PHY/PC 链: 线上 FCS = complemented
+> reflected-CRC-32 寄存器的小端字节序。
 
 ---
 

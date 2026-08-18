@@ -102,11 +102,14 @@ initial begin
         $display("  first 24 bytes: %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X",
                  rb[0],rb[1],rb[2],rb[3],rb[4],rb[5],rb[6],rb[7],rb[8],rb[9],rb[10],rb[11],
                  rb[12],rb[13],rb[14],rb[15],rb[16],rb[17],rb[18],rb[19],rb[20],rb[21],rb[22],rb[23]);
+        $write("  ALL BYTES:");
+        for (mm = 0; mm < 72; mm = mm + 1) $write("%02X ", rb[mm]);
+        $write("\n");
         if (found >= 0 && flen >= found + 72) begin
             crc = 32'hFFFFFFFF;
             for (mm = found + 8; mm < found + 68; mm = mm + 1) crc32_byte_ref(rb[mm], crc);
             crc = crc ^ 32'hFFFFFFFF;
-            fcs = {rb[found+68], rb[found+69], rb[found+70], rb[found+71]};
+            fcs = {rb[found+71], rb[found+70], rb[found+69], rb[found+68]};
             $display("  preamble@%0d FCS %s (computed %08X, sent %02X%02X%02X%02X)", found,
                      (crc == fcs) ? "CORRECT" : "WRONG", crc, rb[found+68], rb[found+69], rb[found+70], rb[found+71]);
         end else if (found == -2 && flen >= 71) begin
@@ -114,7 +117,7 @@ initial begin
             crc = 32'hFFFFFFFF;
             for (mm = 7; mm < 67; mm = mm + 1) crc32_byte_ref(rb[mm], crc);
             crc = crc ^ 32'hFFFFFFFF;
-            fcs = {rb[67], rb[68], rb[69], rb[70]};
+            fcs = {rb[70], rb[69], rb[68], rb[67]};
             $display("  preamble shifted by 1 FCS %s (computed %08X, sent %02X%02X%02X%02X)",
                      (crc == fcs) ? "CORRECT" : "WRONG", crc, rb[67], rb[68], rb[69], rb[70]);
         end else begin

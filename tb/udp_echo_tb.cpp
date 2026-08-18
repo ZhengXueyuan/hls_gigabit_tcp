@@ -104,7 +104,7 @@ void test_tx_default() {
     CHECK(ok,"Payload");
     int ce=n-4; uint32_t ec=0xFFFFFFFF;
     for(int i=8;i<ce;i++) ec=crc32_byte(cap[i],ec); ec^=0xFFFFFFFF;
-    uint32_t rc=((uint32_t)cap[ce]<<24)|((uint32_t)cap[ce+1]<<16)|((uint32_t)cap[ce+2]<<8)|cap[ce+3];
+    uint32_t rc=((uint32_t)cap[ce+3]<<24)|((uint32_t)cap[ce+2]<<16)|((uint32_t)cap[ce+1]<<8)|cap[ce];
     CHECK(ec==rc,"CRC");
 }
 

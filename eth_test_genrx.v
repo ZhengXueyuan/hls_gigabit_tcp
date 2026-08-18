@@ -2,7 +2,7 @@
 //////////////////////////////////////////////////////////////////////////////////
 // Module Name:    ethernet_test 
 //////////////////////////////////////////////////////////////////////////////////
-module eth_test_gen(
+module eth_test_genrx(
     input        sys_clk_50m,
     input       rst_n,
 
@@ -155,9 +155,23 @@ util_gmii_to_rgmii util_gmii_to_rgmii_m0(
     // drive the RGMII util module's GMII inputs directly (like wrapper_min)
     assign e_tx_en  = demo_sending;
     assign e_txd    = demo_out;
-    assign e_rx_dv  = 1'b0;
-    assign e_rxd    = 8'h00;
     assign e_rst_n  = rst_n;
     assign pack_total_len = 32'd125000000;
+
+    // RX sink: consume gmii_rxd/gmii_rx_dv (keeps the RX IDELAY+IDDR chain
+    // and IDELAYCTRL alive, same as the working demo rebuild)
+    reg [7:0] rx_sink_d;
+    reg       rx_sink_dv;
+    reg [15:0] rx_sink_cnt;
+    always @(posedge gmii_rx_clk or negedge rst_n) begin
+        if (!rst_n) begin rx_sink_d<=0; rx_sink_dv<=0; rx_sink_cnt<=0; end
+        else begin
+            rx_sink_d <= gmii_rxd;
+            rx_sink_dv <= gmii_rx_dv;
+            if (gmii_rx_dv) rx_sink_cnt <= rx_sink_cnt + 16'd1;
+        end
+    end
+    assign e_rx_dv  = rx_sink_dv;
+    assign e_rxd    = rx_sink_d;
 
 endmodule

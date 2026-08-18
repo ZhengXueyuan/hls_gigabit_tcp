@@ -5,9 +5,10 @@
 本目录是副本 (原工程保持不变)。移植总纲见 [MIGRATION_K7325T.md](MIGRATION_K7325T.md),
 完整施工日志见 [PORT_NOTES.md](PORT_NOTES.md)。
 
-> **状态 (2026-08-18)**: UART console、RX 通路、协议栈逻辑均已板级/仿真验证;
-> 唯一遗留问题是 **FPGA TX 帧到不了 PC** — 已破案 (demo 克隆生成器的 FCS 位序错,
-> 见 PORT_NOTES), 修复版正在板级复核。端到端 ping → UDP 8080 → TCP 7 待 TX 打通后验证。
+> **状态 (2026-08-18)**: **TX 已打通!** 根因 = FCS 字节序 (必须 LSB-first, 见下),
+> wrapper_min 板级验证 pktmon 25s = 25 帧 FPGA ARP (与 demo 逐字节一致) ✓。
+> UART console、RX 通路、协议栈逻辑此前已验证。进行中: HLS IP 同修复重综合 +
+> wrapper_1g (ip_enable=1) 重建 → 端到端 ping → UDP 8080 → TCP 7 全链验证。
 
 ## 硬件
 
@@ -108,8 +109,13 @@ pktmon format pk.etl -o pk.txt   # 以太网 RX 帧以 "PktGroupId" 分组
 | 2 | DHCP 帧缺 IP 头 + 缓冲越界 | ✅ 已修 (完整 IPv4 头 + 新帧布局) |
 | 3 | DHCP 无限洪泛 (~134ms/次) | ✅ 已修 (DHCP_FAILED 状态 + 重试复位) |
 | 4 | wrapper rx_last_in 极性反 | ✅ 已修 (dv 下降沿) |
-| 5 | demo 克隆生成器 FCS 位序错 (unreflected CRC) → 所有克隆帧被网卡当 FCS 错丢弃 | ✅ 已修 (标准 reflected CRC-32, 板级复核中) |
-| 6 | TX 帧到不了 PC (pktmon 零包) | 🔧 根因=#5, 修复版板级复核中 |
+| 5 | demo 克隆生成器 FCS 错 (两重: ① unreflected CRC 多项式 ② 线上字节序 MSB-first) → 所有帧被网卡当 FCS 错静默丢弃 | ✅ 已修 (reflected CRC-32 + **LSB-first 字节序** fcs[7:0],[15:8],[23:16],[31:24], 板级验证 pk21 = 25 帧 ✓) |
+| 6 | TX 帧到不了 PC (pktmon 零包) | ✅ 已通 (wrapper_min 板级验证); 主设计全链验证进行中 |
+
+> **FCS 铁律 (本板 PHY/PC 链)**: 线上 FCS 字节序必须 LSB-first — demo 帧 FCS = CA A3 F9 63
+> (zlib 寄存器 0x63F9A3CA 的小端输出)。FCS 的"标准"有实现歧义, **必须以权威 demo 位流的
+> 线上字节为基准, 不能用自己的参考实现自证** (自证闭环漏掉了字节序)。之前的功率/结构/
+> 相位假设全部撤销, 归因于此。
 
 ## 项目结构
 

@@ -158,10 +158,10 @@ initial begin
             for (i = 8; i < tx_frame_len[0] - 4; i = i + 1)
                 crc32_byte_ref(tx_buf[tx_frame_start[0] + i], crc);
             crc = crc ^ 32'hFFFFFFFF;
-            fcs = {tx_buf[tx_frame_start[0] + tx_frame_len[0] - 4],
-                   tx_buf[tx_frame_start[0] + tx_frame_len[0] - 3],
+            fcs = {tx_buf[tx_frame_start[0] + tx_frame_len[0] - 1],
                    tx_buf[tx_frame_start[0] + tx_frame_len[0] - 2],
-                   tx_buf[tx_frame_start[0] + tx_frame_len[0] - 1]};
+                   tx_buf[tx_frame_start[0] + tx_frame_len[0] - 3],
+                   tx_buf[tx_frame_start[0] + tx_frame_len[0] - 4]};
             $display("computed FCS = %08X  on-wire FCS = %08X", crc, fcs);
             if (crc == fcs) $display("RESULT: FCS CORRECT");
             else            $display("RESULT: FCS WRONG  ***");

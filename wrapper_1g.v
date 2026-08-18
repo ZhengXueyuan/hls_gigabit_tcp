@@ -203,10 +203,13 @@ module wrapper_1g (
     wire [31:0] demo_fcs = ~demo_crc;   // final complement, MSB-first on wire
     wire [7:0] demo_out =
         (demo_idx < 7'd68) ? demo_byte(demo_idx) :
-        (demo_idx == 7'd68) ? demo_fcs[31:24] :
-        (demo_idx == 7'd69) ? demo_fcs[23:16] :
-        (demo_idx == 7'd70) ? demo_fcs[15:8] :
-                              demo_fcs[7:0];
+        // FIX 2026-08-18 #2: the board's PHY/NIC chain expects the FCS in
+        // LSB-first byte order (demo's wire FCS = CA A3 F9 63 = zlib register
+        // little-endian). MSB-first (63 F9 A3 CA) frames were silently dropped.
+        (demo_idx == 7'd68) ? demo_fcs[7:0]  :
+        (demo_idx == 7'd69) ? demo_fcs[15:8] :
+        (demo_idx == 7'd70) ? demo_fcs[23:16] :
+                              demo_fcs[31:24];
 
     // Mux: demo clone has priority; HLS bridge frames wait (bridge backs
     // up in the FIFO while the 72-cycle demo frame goes out).
@@ -357,7 +360,7 @@ module wrapper_1g (
     reg ip_enable;
     always @(posedge gmii_clk or negedge reset_n) begin
         if (!reset_n) ip_enable <= 1'b0;
-        else          ip_enable <= 1'b0;   // keep IP held in reset (experiment)
+        else          ip_enable <= 1'b1;   // IP RUNNING (FCS fix verified)
     end
 
     // Network IP instance
