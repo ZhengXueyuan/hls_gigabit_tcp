@@ -964,3 +964,34 @@ end
 - 选项 A 更干净, 消除多段队列根本不需要 — 536B 单帧直接 echo。
 - 当前 TCP 25B 小载荷可用, 大数据待修。
 
+## 2026-08-20 凌晨 — TCP 多段竞态攻坚 (6 轮迭代)
+
+### 问题定位
+- 1608B (3 段) PASS, 1727B+ FAIL。精确边界: 1726B PASS, 1727B FAIL。
+- 偏移 1726 = 536×3+118, buffer[39] byte 2。非确定性错误, 典型 buffer 读写竞态。
+
+### 尝试的方案
+| 方案 | 结果 |
+|------|------|
+| 1-pass 顶层延迟 (rx_pending) | ❌ 破坏 csim (ICMP 测试) |
+| MAC_RX_FLUSH (不丢 stream) | ❌ 无效果 |
+| 条件延迟 (MAC TX 忙时保存帧) + 4-FIFO | ✅ 2000B PASS, ❌ 4096B+ 截断@2144 |
+| 条件延迟 + 16-FIFO | ❌ 同 4096B+ 截断 |
+| FLUSH + volatile 强制提交 | ❌ 无效果 |
+| FLUSH 中设置 rx.valid (1 pass 延迟) | ❌ 仍偏移 1726 |
+
+### 根因分析
+条件延迟 (MAC TX 忙时保存帧) 是唯一让 2000B PASS 的方案。但 4096B+ 失败的原因:
+FIFO 保存 mac_rx 元数据但不保存 payload 数据。新帧到达时 MAC RX 覆盖共享 buffer,
+FIFO 中旧帧指向的 payload 数据已丢失。
+
+### 当前代码状态 (commit 607b510)
+- TX_UDP_BASE=320, TCP_TX_CHUNK=536 (单帧装 536B)
+- tcp_queue: 去掉立即发送, 全部走 idle 门控队列
+- layer_mac.cpp: MAC_RX_FLUSH 状态 (rx.valid 延迟 1 pass)
+- 2000B 仍 FAIL (需要条件延迟, 但条件延迟需配套双缓冲)
+
+### 下一轮修复方向
+- 双缓冲: RX buffer 分成两个区域, MAC RX 交替写入。帧 N 在处理时, 帧 N+1 写入另一区域。
+- 或: 条件延迟 + payload 保存 (将 payload 数据从 buffer 拷贝到独立 BRAM 后再处理)
+
