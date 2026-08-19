@@ -24,7 +24,7 @@ bool arp_lookup(arp_entry_t *table, ap_uint<32> ip, mac_addr_t &mac);
 // FIX 2026-08-18: the TX frame lives at TX_UDP_BASE (384); the region ends
 // at word 512. IP(5) + TCP(5) leaves 123 words = 492 bytes, so a payload
 // chunk must not exceed 472 bytes or the frame overruns the buffer.
-#define TCP_TX_CHUNK     472
+#define TCP_TX_CHUNK     536
 // FIX 2026-08-19 (agent): Windows IGNORES the advertised MSS=460 and sends
 // 536-byte segments (IP total 576) regardless. The old payload[] array was
 // TCP_MSS(460) wide with a fill guard `plen<=TCP_MSS`, so a 536B segment
@@ -243,19 +243,11 @@ static void tcp_queue(uint32_t *buf, mac_tx_req_t &tx_req, int8_t cid,
                       const uint8_t *payload, uint16_t pay_len,
                       bool mac_busy){
     if(cid<0||cid>=MAX_TCP_CONN||pay_len==0)return;
-    // Can we send immediately? (MAC idle, nothing queued, TX free)
-    if(!mac_busy && !tx_req.request && tcp_q_len==tcp_q_off){
-        uint16_t first=(pay_len>TCP_TX_CHUNK)?TCP_TX_CHUNK:pay_len;
-        tcp_send(buf,tx_req,cid,TCP_ACK,payload,first);
-        if(pay_len>first){
-            uint16_t rem=pay_len-first;
-            if(rem>TCP_SEND_BUF)rem=TCP_SEND_BUF;
-            for(int i=0;i<rem;i++)tcp_send_bufs[cid][i]=payload[first+i];
-            tcp_q_len=rem;tcp_q_off=0;tcp_q_cid=cid;
-        }
-        return;
-    }
-    // MAC busy or queue non-empty: park the whole payload in the queue
+    // Always queue. The immediate-send path was removed: its gate
+    // (!mac_busy && !tx_req.request) could appear "idle" in the same pass
+    // the MAC commits to reading the buffer, causing a write/read race.
+    // tcp_maintenance flushes the queue when the top level sees the MAC
+    // truly idle, one chunk per pass.
     if(tcp_q_len==tcp_q_off){tcp_q_len=0;tcp_q_off=0;tcp_q_cid=cid;}
     uint16_t room=TCP_SEND_BUF-tcp_q_len;
     if(room>pay_len)room=pay_len;

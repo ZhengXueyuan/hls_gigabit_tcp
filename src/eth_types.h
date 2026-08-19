@@ -130,8 +130,14 @@ struct gmii_byte_t {
 #define RX_BUFFER_SIZE      256   // UDP RX payload area
 #define TX_SCRATCH_BASE     256   // ARP/ICMP TX frame scratch area
 #define TX_SCRATCH_SIZE     128
-#define TX_UDP_BASE         384   // UDP TX payload area
-#define TX_UDP_SIZE         128
+// FIX 2026-08-19: TX_UDP_BASE moved down from 384 so a single 536B TCP segment
+// (Windows ignores the MSS=460 advert) fits in ONE TX frame: 20 IP + 20 TCP +
+// 536 payload = 576B = 144 words. Region 320..512 = 192 words = 768B (48-word
+// margin). Word 256 (=TX_SCRATCH_BASE) is deliberately avoided: ARP/ICMP reply
+// builders write there ungated, so a TCP frame in flight would be clobbered.
+// Overlap with the DHCP TX region (288..369) is guarded by tx_req arbitration.
+#define TX_UDP_BASE         320   // UDP/TCP TX payload area
+#define TX_UDP_SIZE         192   // 320..512 = 768B, fits the 576B max TCP frame
 
 //=============================================================================
 // Timing

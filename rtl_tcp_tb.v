@@ -99,16 +99,19 @@ task feed_frame(input integer fcnt);
 begin
     begin : loop
         integer b;
+        rx_stream_TVALID = 0;
+        @(posedge ap_clk);
         for (b = 0; b < fcnt; b = b + 1) begin
+            // wait until regslice output is empty (MAC RX consumed previous byte)
+            while (dut.rx_stream_TVALID_int_regslice) @(posedge ap_clk);
             rx_stream_TDATA = {(b == fcnt - 1), f[b]};   // bit8 = TLAST on last byte
             rx_stream_TVALID = 1;
-            while (!rx_stream_TREADY) @(posedge ap_clk);
+            // standard AXI master handshake: hold until TVALID&&TREADY, then one
+            // extra cycle so the regslice samples on the posedge
+            while (!(rx_stream_TVALID && rx_stream_TREADY)) @(posedge ap_clk);
+            @(posedge ap_clk);
             rx_total = rx_total + 1;
-            if (feed_mode == 0) begin
-                @(posedge ap_clk);
-                rx_stream_TVALID = 0;
-                @(posedge ap_clk);
-            end
+            rx_stream_TVALID = 0;
         end
         rx_stream_TVALID = 0;
         @(posedge ap_clk);
