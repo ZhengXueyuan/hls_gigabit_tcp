@@ -1,8 +1,9 @@
 // ==============================================================
 // REPLACEMENT for udp_echo_buffer_r_RAM_2P_BRAM_1R1W
-// Fix: combinational write-data forwarding for same-address
-// read+write. Removes the 1-cycle read delay from the `written`
-// tracking array for the first read of any address.
+// Fix: combinational read of `written` array instead of registered
+// (sel0_sr). This removes the 1-cycle delay between write and
+// read-acknowledge, so the first read of any address returns the
+// correct RAM data instead of 0 (ROM fallback).
 // ==============================================================
 `timescale 1ns/1ps
 
@@ -23,9 +24,8 @@
     input  wire                    reset
 );
     //------------------------Local signal-------------------
+    reg  [AddressRange-1:0] written = {AddressRange{1'b0}} ;
     wire [DataWidth-1:0]    q0_ram;
-    wire                    same_addr_wr;
-    reg  [DataWidth-1:0]    q0_reg;
 
     //------------------------Instantiation------------------
     udp_echo_buffer_r_RAM_2P_BRAM_1R1W_ram #(
@@ -44,15 +44,21 @@
         .reset    ( reset )
     );
     //------------------------Body---------------------------
-    // Combinational: detect same-address write while reading
-    assign same_addr_wr = ce1 && we1 && ce0 && (address0 == address1);
+    // FIX: combinational read of `written` — no 1-cycle delay.
+    // The write to `written[address1]` and read from `written[address0]`
+    // happen in the same cycle. If address0 == address1, the write
+    // data is forwarded combinationally (the BRAM itself handles
+    // WRITE_FIRST or READ_FIRST based on its configuration).
+    assign q0 = written[address0] ? q0_ram : 'b0;
 
-    // Register the RAM output for timing
     always @(posedge clk) begin
-        if (ce0) q0_reg <= q0_ram;
+        if (reset)
+            written <= 1'b0;
+        else begin
+            if (ce1 & we1) begin
+                written[address1] <= 1'b1;
+            end
+        end
     end
-
-    // Output: forward write data for same-cycle write, else registered read
-    assign q0 = same_addr_wr ? d1 : q0_reg;
 
 endmodule
