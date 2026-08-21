@@ -9,13 +9,6 @@ create_project -force $project_name ./vivado_prj -part $part_name
 
 # Network IP RTL
 import_files -norecurse [glob udp_echo_prj/solution1/syn/verilog/*.v]
-# Replace HLS-generated buffer BRAM wrapper with WRITE_FIRST version
-# (combinational write-data forwarding, removes the 1-cycle read delay)
-set bram_wrapper [glob -nocomplain vivado_prj/udp_dual_phy1g2.srcs/sources_1/imports/verilog/udp_echo_buffer_r_RAM_2P_BRAM_1R1W.v]
-if {[llength $bram_wrapper] > 0} {
-    file copy -force buffer_bram_fix.v [lindex $bram_wrapper 0]
-    puts "BRAM wrapper replaced with WRITE_FIRST version"
-}
 # UART IP RTL
 import_files -norecurse [glob uart_hls/uart_prj/solution1/syn/verilog/*.v]
 # Wrapper + net_stats debug module + demo RGMII converter (verbatim)
