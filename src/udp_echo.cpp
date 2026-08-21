@@ -60,6 +60,12 @@ void udp_echo(
     static ap_uint<32> rx_src_ip  = 0;
     static bool     init_done     = false;
 
+    // FIX 2026-08-22: buffer[39] shadow for TCP multi-segment debug.
+    // MAC RX writes to buffer[39]; we save the value here and compare
+    // when TCP reads it. Mismatch → buf39_err counter incremented.
+    static uint32_t buf39_shadow  = 0;
+    static uint16_t buf39_err_cnt = 0;
+
     // DHCP state (Phase 5)
     static uint8_t  dhcp_state   = DHCP_IDLE;
     static uint32_t dhcp_xid     = 0;
@@ -110,6 +116,12 @@ void udp_echo(
     mac_rx_process(reset_n, rx_stream, buffer, mac_rx);
     mac_tx_process(reset_n, tx_req, buffer, tx_stream, mac_tx_busy);
 
+    // FIX 2026-08-22: save buffer[39] shadow after MAC RX write, compare
+    // before TCP read. If they differ, the BRAM read returned wrong data.
+    if (mac_rx.valid) {
+        buf39_shadow = buffer[39];
+    }
+
     ip_rx.valid = false;
     udp_rx.valid = false;
 
@@ -124,6 +136,10 @@ void udp_echo(
                 } else if (ip_rx.protocol == IP_PROTO_IGMP) {
                     igmp_rx_process(reset_n, ip_rx, buffer, tx_req);
                 } else if (ip_rx.protocol == IP_PROTO_TCP) {
+                    // FIX 2026-08-22: compare buffer[39] with shadow
+                    if (buffer[39] != buf39_shadow) {
+                        buf39_err_cnt++;
+                    }
                     tcp_rx_process(reset_n, ip_rx, buffer, tx_req, mac_tx_busy);
                 } else if (ip_rx.protocol == IP_PROTO_UDP) {
                     udp_rx_process(reset_n, ip_rx, buffer, udp_rx);
@@ -191,7 +207,9 @@ void udp_echo(
     // TX counting: when TX request is consumed and MAC TX starts
     if (tx_req.request && last_tx==0) { stats_event(1, tx_req.buf_len+18); } // +MAC+CRC
     last_tx = tx_req.request ? 1 : 0;
-    stats_report(reset_n, msg_stream, stats_should_dump());
+    stats_report(reset_n, msg_stream, stats_should_dump(), buf39_err_cnt);
+    // FIX 2026-08-22: LED D0 = buffer[39] mismatch detected (diagnostic)
+    led_d0 = (buf39_err_cnt > 0);
 
     // DHCP status output for wrapper-level LED logic
     led_d0 = (dhcp_state == DHCP_DONE);   // 1 = DHCP acquired

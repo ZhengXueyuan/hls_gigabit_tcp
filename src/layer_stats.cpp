@@ -22,7 +22,7 @@ static void stats_dhcp_done(uint32_t ip){dhcp_flag=true;dhcp_ip=ip;}
 
 void arp_dump(hls::stream<gmii_byte_t>&msg);
 
-static void stats_report(bool rst, hls::stream<gmii_byte_t>&msg, bool do_arp){
+static void stats_report(bool rst, hls::stream<gmii_byte_t>&msg, bool do_arp, uint16_t buf39_err){
     if(!rst){rx_pkt=tx_pkt=rx_byte=tx_byte=arp_rx=icmp_rx=dhcp_ev=igmp_rx=timer=0;dhcp_flag=false;return;}
     timer++; if(timer<100000000 && !dhcp_flag && !do_arp) return; timer=0;
     auto e=[&](char c){gmii_byte_t b;b.data=c;b.last=false;if(!msg.full())msg.write(b);};
@@ -32,7 +32,8 @@ static void stats_report(bool rst, hls::stream<gmii_byte_t>&msg, bool do_arp){
     e('R');e('X');e(':');pd(rx_pkt);e('p');e('k');e('t');e(' ');pd(rx_byte);e('B');
     e(' ');e('T');e('X');e(':');pd(tx_pkt);e('p');e('k');e(' ');pd(tx_byte);e('B');
     e(' ');e('A');e(':');pd(arp_rx);e(' ');e('I');e(':');pd(icmp_rx);
-    e(' ');e('G');e(':');pd(igmp_rx);e(' ');e('D');e(':');pd(dhcp_ev);e('\n');
+    e(' ');e('G');e(':');pd(igmp_rx);e(' ');e('D');e(':');pd(dhcp_ev);
+    e(' ');e('3');e('9');e(':');pd(buf39_err);e('\n');
     if(do_arp||arp_rx>0){e('A');e('R');e('P');e(':');e('\n');arp_dump(msg);}
     force_arp=false;
 }
