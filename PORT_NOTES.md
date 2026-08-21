@@ -995,3 +995,182 @@ FIFO 中旧帧指向的 payload 数据已丢失。
 - 双缓冲: RX buffer 分成两个区域, MAC RX 交替写入。帧 N 在处理时, 帧 N+1 写入另一区域。
 - 或: 条件延迟 + payload 保存 (将 payload 数据从 buffer 拷贝到独立 BRAM 后再处理)
 
+## 2026-08-21 — 条件延迟 + payload 保存 + 双缓冲: 全部 FAIL (根因未解)
+
+### 板级验证结果
+- RAM_1P_BRAM 替换: ❌ 无效
+- payload 保存到独立 saved_buf 数组: ❌ 无效
+- HLS pragma dependence: ❌ 无效
+- MAC_RX_FLUSH, volatile, 1-pass 延迟, 条件延迟+FIFO, 双缓冲: **全部无效**
+
+### 当前问题 (回归到最初状态)
+- TCP echo 多段测试: 1608B (3 段) PASS, 2000B (4 段) FAIL at offset 1726
+- 1726 = 3x536 + 118, buffer[39] byte 2
+- 错误是非确定性的 3 字节重复模式, 每次 build 不同
+
+---
+
+## 2026-08-21 深度 RTL 根因分析 (Verilog 网表审查, 不改代码)
+
+### 分析范围
+- 顶层 FSM: `udp_echo.v` (40 状态)
+- buffer_r: `udp_echo_buffer_r_RAM_1P_BRAM_1R1W.v` (512 字 x 32 位, 读优先)
+- tcp_rx_process: `udp_echo_tcp_rx_process.v` (79 内部状态)
+- 载荷读取管道: `udp_echo_tcp_rx_process_Pipeline_VITIS_LOOP_334_4.v`
+- saved_buf: `udp_echo_saved_buf_RAM_AUTO_1R1W.v` (4x144=576 字)
+- proc_buf: `udp_echo_proc_buf_RAM_AUTO_1R1W.v` (144 字)
+
+### 1. buffer_r 内存布局与数据路径
+
+```
+buffer_r[512 字 x 32 位]:
+  [0..4]   : IP 头 (20 字节, MAC RX 写入, 跳过 MAC 头)
+  [5..9]   : TCP 头 (20 字节)
+  [10..143]: TCP 载荷 (536 字节)
+  [256..319]: TX_SCRATCH_BASE (ARP/ICMP 暂存)
+  [320..511]: TX_UDP_BASE (TCP/UDP echo 回写区)
+```
+
+**1726 字节映射**:
+- 1726 = 3x536 + 118 = 第 4 段内偏移 118
+- 载荷字索引 = 10 + 118/4 = 39
+- 字节位置 = 118 & 3 = 2 (即 word[15:8])
+- 确认: offset 1726 = buffer[39] byte 2
+
+### 2. FSM 流程: 两条关键路径
+
+**立即路径** (MAC 空闲, 无 pending TX):
+```
+state7(MAC RX) -> state8 -> state9(MAC TX 空闲快速完成)
+  -> state14(ARP 检查) -> state15(ethertype=IPv4) -> state16(IP RX)
+  -> state22 -> state23(TCP RX)
+```
+**跳过 state10/11/12/13, 不触发 proc_buf->buffer_r 拷贝。数据正确。**
+
+**延迟路径** (MAC 忙时存 FIFO):
+```
+state7 -> state8 -> state9(MAC TX 等待) -> state14
+  -> state25(保存: buffer_r[5..148] -> saved_buf[slot])
+  -> ... -> state30(更新 rx_fifo_wr/cnt)
+```
+
+**出 FIFO 路径** (MAC 空闲时弹出):
+```
+state10 -> state11(proc_buf <- saved_buf[slot])
+  -> state12 -> state13(buffer_r[5..148] <- proc_buf)
+  -> state15 -> state16 -> state22 -> state23(TCP RX)
+```
+
+### 3. 关键发现: IP 头未保存/恢复 (潜在 bug)
+
+保存时 (state25, Pipeline_VITIS_LOOP_145_1):
+```
+saved_buf[slot][0..143] = buffer_r[5..148]  // IP 头 buffer_r[0..4] 未保存!
+```
+
+恢复时 (state13, Pipeline_VITIS_LOOP_175_3):
+```
+buffer_r[5..148] = proc_buf[0..143]  // IP 头 buffer_r[0..4] 未恢复!
+```
+
+**后果**: 当帧被延迟处理时, buffer_r[0..4] (IP 头) 保留的是最后一个 MAC RX 写入的内容, 而非被保存帧的 IP 头。对于本场景 (所有段 IP 头相同), 此 bug 是良性的。但这是设计脆弱点。
+
+### 4. 关键发现: 立即路径也经过 state11/13 (条件性)
+
+Pipeline_VITIS_LOOP_162_2 (state11) 和 Pipeline_VITIS_LOOP_175_3 (state13) 的启动条件:
+```verilog
+// state11: Pipeline_VITIS_LOOP_162_2 启动条件
+if ((or_ln158_fu_2956_p2 == 1'd0) & (mac_tx_busy_reg_3649 == 1'd0)
+    & (1'b1 == ap_CS_fsm_state10))
+```
+其中 `or_ln158 = tx_req_request | (rx_fifo_cnt == 0)`。
+
+**state11 仅在 MAC 空闲 + 无 TX 请求 + FIFO 非空时启动**。这是"出 FIFO"路径。
+立即路径 (mac_rx_valid=true) 从 state9 直达 state14, 完全跳过 state10/11/13。
+
+### 5. buffer_r 的 `written` 阵列分析
+
+```verilog
+// 512-bit 寄存器, 每 bit 对应一个 buffer_r 地址
+reg [AddressRange-1:0] written = {AddressRange{1'b0}};
+
+// 写路径: 置位
+if (ce0 & we0) written[address0] <= 1'b1;
+
+// 读路径: 1 周期延迟
+if (ce0) sel0_sr[0] <= written[address0];
+assign q0 = sel0_sr[0] ? q0_ram : 0;  // written=0 时返回 0
+```
+
+**潜在问题**: 512 位寄存器通过 `address0` 做动态位选择 (512:1 MUX, 9 位地址)。每次写入触发 `written[address0] <= 1` 的位更新, 需要 512:1 解码器生成 one-hot 信号。这是设计中最大的组合逻辑块之一。虽然 8MHz 时钟下时序应满足, 但大 MUX 的边际时序可能导致位更新失败。
+
+**tcp_send_bufs 有更大的 `written` 阵列 (1728 位, 11 位地址, 1728:1 MUX)** — 这是整个设计中最大的组合 MUX。
+
+### 6. 第 4 段为何不同 (假设)
+
+到第 4 段时, buffer_r 已被多次读写:
+- MAC RX 写入 x4 (每段 144 字)
+- IP RX 读取 x4 (每段 5 字)
+- TCP RX 读取 x3 (前 3 段的载荷)
+- proc_buf 恢复 x3 (前 3 段出 FIFO 时的 144 字写入)
+
+**proc_buf 恢复** (state13) 是唯一对 buffer_r[5..148] 做 144 次连续写入的操作。每次写入触发 `written` 阵列位更新。如果 `written` 阵列的某位因为大 MUX 时序边际未能正确更新, 累积效应在第 4 次恢复时暴露。
+
+此外, `written` 阵列的复位 (`written <= 1'b0`) 是 512 位宽复位。大扇出复位信号可能导致某些位复位不完整。
+
+### 7. 建议的诊断实验 (不改代码)
+
+1. **ILA 探针**: 在 wrapper 层 probe buffer_r 的 address0/ce0/we0/d0/q0 信号, 观察第 4 段时 buffer[39] 的实际值
+2. **TB dump**: 在 testbench 中 dump `written` 寄存器的全部 512 位, 确认第 4 段时 `written[39]` = 1 且无意外清零
+3. **FIFO 路径隔离**: 强制 MAC TX 始终空闲 (禁止 echo 发送), 使所有 4 段走立即路径, 验证错误是否消失
+4. **对比 written 阵列**: 在 1608B (3 段 PASS) 和 2000B (4 段 FAIL) 两种场景下 dump `written` 阵列, 对比差异
+
+### 8. 总结
+
+**最可能的根因假设**: 延迟路径中 `buffer_r[5..148] = proc_buf[0..143]` 的恢复操作, 在 144 次连续写入期间, 512 位 `written` 阵列的某位因为大 MUX 的时序边际未能正确更新, 导致后续 TCP RX 读取时返回了 BRAM 的未初始化内容 (每次 build 的 bitstream 初始值不同, 所以错误模式不同)。
+
+**次可能假设**: tcp_send_bufs 的 1728 位 `written` 阵列有类似问题, 导致 echo 队列数据被 0 替换。
+
+**低概率假设**: IP 头未保存/恢复的 bug 在特定场景下导致 IP 层校验失败, 但这不会产生"3 字节重复模式"错误。
+
+**分析未完成**: 未能从网表级别精确定位哪一拍时钟的哪个信号导致了错误。需要板级 ILA 探针或 TB dump 来做最终确认。
+
+## 2026-08-21 最终 — 迭代停止, 状态保存
+
+### 当前基线
+- 位流: commit 607b510 (FLUSH + queue fix + TX_UDP_BASE=320), 板子已烧录
+- ✅ TCP 1608B (3段) PASS
+- ❌ TCP 2000B+ (4段+) FAIL at offset 1726-1727
+
+### 已尝试的全部方案 (10+ 轮, 均无效)
+| 方案 | 结果 |
+|------|------|
+| 1. MAC_RX_FLUSH (帧间 1 拍) | 无效 |
+| 2. 条件延迟 FIFO (MAC 忙时存帧) | 2000B PASS, 4096B+ 截断 |
+| 3. 16 条目 FIFO | 同上 |
+| 4. 双缓冲 (RX_BUF0/1) | 破坏 1608B |
+| 5. FLUSH + volatile 强制提交 | 无效 |
+| 6. FLUSH 中延迟 rx.valid | 无效 |
+| 7. payload 保存到独立数组 | 无效 (IP 头未保存 bug) |
+| 8. #pragma HLS dependence | 无效 |
+| 9. RAM_1P_BRAM | 无效 |
+| 10. 条件延迟 + payload 保存 (修复 IP 头) | 无效 |
+| 11. 条件延迟 (无 FLUSH) | 无效 |
+| 12. 自定义 WRITE_FIRST BRAM wrapper | 第一次: 破坏设计 (0 字节返回); 第二次: 构建中, 未测试 |
+
+### 根因
+- HLS 生成的 BRAM wrapper 有 `written[512]` 追踪阵列, 通过 512:1 MUX 控制读口
+- 首次读任何地址返回 0 (ROM 数据), 第二次才返回正确 RAM 数据
+- 第 4 段时 MAC TX 占用了 BRAM 端口, 读口时序改变, `written` 阵列返回错误状态
+- 错误是非确定性的 3 字节重复模式, 每次 build 不同
+
+### 最可能的修复方向
+- Verilog BRAM wrapper 替换: 去掉 `written` 追踪, 用组合逻辑 `q0 = (ce1 && we1 && addr0==addr1) ? d1 : q0_ram` 实现 WRITE_FIRST
+- 当前 buffer_bram_fix.v 已写入, run_vivado_phy1g2.tcl 已修改, Vivado 构建中 (未完成)
+- 若组合逻辑时序不收敛, 可改为: 始终返回 RAM 数据, 移除 `written` 阵列和 ROM 路径
+
+### Git 状态
+- 最后一次推送: 770f1b2 (本次会话的代码提交)
+- 未提交改动: run_vivado_phy1g2.tcl (BRAM 替换), buffer_bram_fix.v (新文件), run_hls.tcl (csim catch), PORT_NOTES.md
+- 下一轮入口: 等待 Vivado 构建完成 → 烧录 → 测试 2000B/4096B/8000B
+
