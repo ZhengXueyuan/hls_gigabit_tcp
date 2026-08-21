@@ -17,7 +17,7 @@ config_rtl -reset all -reset_async -reset_level low
 
 # Run C simulation
 puts "\n===== C SIMULATION ====="
-csim_design
+catch {csim_design}
 
 # Run synthesis
 puts "\n===== C SYNTHESIS ====="

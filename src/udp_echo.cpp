@@ -60,11 +60,12 @@ void udp_echo(
     static ap_uint<32> rx_src_ip  = 0;
     static bool     init_done     = false;
 
-    // FIX 2026-08-22: buffer[39] shadow for TCP multi-segment debug.
-    // MAC RX writes to buffer[39]; we save the value here and compare
-    // when TCP reads it. Mismatch → buf39_err counter incremented.
-    static uint32_t buf39_shadow  = 0;
-    static uint16_t buf39_err_cnt = 0;
+    // Conditional delay FIFO: 4 entries
+    static mac_rx_t rx_fifo[4];
+    static uint8_t  rx_fifo_wr = 0, rx_fifo_rd = 0, rx_fifo_cnt = 0;
+    #pragma HLS RESET variable=rx_fifo_wr
+    #pragma HLS RESET variable=rx_fifo_rd
+    #pragma HLS RESET variable=rx_fifo_cnt
 
     // DHCP state (Phase 5)
     static uint8_t  dhcp_state   = DHCP_IDLE;
@@ -93,6 +94,9 @@ void udp_echo(
         dhcp_timer     = 0;
         dhcp_start     = false;
         dhcp_delay     = 0;
+        rx_fifo_wr     = 0;
+        rx_fifo_rd     = 0;
+        rx_fifo_cnt    = 0;
     } else {
         // One-time init
         if (!init_done) {
@@ -116,30 +120,28 @@ void udp_echo(
     mac_rx_process(reset_n, rx_stream, buffer, mac_rx);
     mac_tx_process(reset_n, tx_req, buffer, tx_stream, mac_tx_busy);
 
-    // FIX 2026-08-22: save buffer[39] shadow after MAC RX write, compare
-    // before TCP read. If they differ, the BRAM read returned wrong data.
-    if (mac_rx.valid) {
-        buf39_shadow = buffer[39];
-    }
-
     ip_rx.valid = false;
     udp_rx.valid = false;
 
+    mac_rx_t proc_rx; bool do_process = false;
     if (mac_rx.valid) {
-        if (mac_rx.ethertype == ETHERTYPE_ARP) {
-            arp_rx_process(reset_n, mac_rx, buffer, tx_req, NULL);
-        } else if (mac_rx.ethertype == ETHERTYPE_IPV4) {
-            ip_rx_process(reset_n, mac_rx, buffer, ip_rx);
+        if (mac_tx_busy || tx_req.request) {
+            if (rx_fifo_cnt < 4) { rx_fifo[rx_fifo_wr]=mac_rx; rx_fifo_wr=(rx_fifo_wr+1)&3; rx_fifo_cnt++; }
+        } else { proc_rx=mac_rx; do_process=true; }
+    } else if (!mac_tx_busy && !tx_req.request && rx_fifo_cnt > 0) {
+        proc_rx=rx_fifo[rx_fifo_rd]; rx_fifo_rd=(rx_fifo_rd+1)&3; rx_fifo_cnt--; do_process=true;
+    }
+    if (do_process) {
+        if (proc_rx.ethertype == ETHERTYPE_ARP) {
+            arp_rx_process(reset_n, proc_rx, buffer, tx_req, NULL);
+        } else if (proc_rx.ethertype == ETHERTYPE_IPV4) {
+            ip_rx_process(reset_n, proc_rx, buffer, ip_rx);
             if (ip_rx.valid) {
                 if (ip_rx.protocol == IP_PROTO_ICMP) {
                     icmp_rx_process(reset_n, ip_rx, buffer, tx_req);
                 } else if (ip_rx.protocol == IP_PROTO_IGMP) {
                     igmp_rx_process(reset_n, ip_rx, buffer, tx_req);
                 } else if (ip_rx.protocol == IP_PROTO_TCP) {
-                    // FIX 2026-08-22: compare buffer[39] with shadow
-                    if (buffer[39] != buf39_shadow) {
-                        buf39_err_cnt++;
-                    }
                     tcp_rx_process(reset_n, ip_rx, buffer, tx_req, mac_tx_busy);
                 } else if (ip_rx.protocol == IP_PROTO_UDP) {
                     udp_rx_process(reset_n, ip_rx, buffer, udp_rx);
@@ -196,9 +198,9 @@ void udp_echo(
     // Statistics tracking + periodic report
     static bool dhcp_reported = false;
     static uint32_t last_tx = 0;
-    if (mac_rx.valid) {
-        if (mac_rx.ethertype == ETHERTYPE_ARP) stats_event(2,0);
-        else if (mac_rx.ethertype == ETHERTYPE_IPV4) stats_event(0, ip_rx.valid ? (uint16_t)ip_rx.total_len : (uint16_t)60);
+    if (do_process) {
+        if (proc_rx.ethertype == ETHERTYPE_ARP) stats_event(2,0);
+        else if (proc_rx.ethertype == ETHERTYPE_IPV4) stats_event(0, ip_rx.valid ? (uint16_t)ip_rx.total_len : (uint16_t)60);
     }
     if (dhcp_state == DHCP_DONE && !dhcp_reported) {
         stats_event(4,0); stats_dhcp_done(dhcp_offered); dhcp_reported=true;
@@ -207,9 +209,7 @@ void udp_echo(
     // TX counting: when TX request is consumed and MAC TX starts
     if (tx_req.request && last_tx==0) { stats_event(1, tx_req.buf_len+18); } // +MAC+CRC
     last_tx = tx_req.request ? 1 : 0;
-    stats_report(reset_n, msg_stream, stats_should_dump(), buf39_err_cnt);
-    // FIX 2026-08-22: LED D0 = buffer[39] mismatch detected (diagnostic)
-    led_d0 = (buf39_err_cnt > 0);
+    stats_report(reset_n, msg_stream, stats_should_dump(), 0);
 
     // DHCP status output for wrapper-level LED logic
     led_d0 = (dhcp_state == DHCP_DONE);   // 1 = DHCP acquired

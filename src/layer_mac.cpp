@@ -11,7 +11,7 @@
 #include "eth_types.h"
 #include "eth_utils.h"
 
-enum { MAC_RX_IDLE, MAC_RX_PREAMBLE, MAC_RX_HEADER, MAC_RX_VLAN, MAC_RX_PAYLOAD, MAC_RX_FLUSH };
+enum { MAC_RX_IDLE, MAC_RX_PREAMBLE, MAC_RX_HEADER, MAC_RX_VLAN, MAC_RX_PAYLOAD };
 enum { MAC_TX_IDLE, MAC_TX_SEND55, MAC_TX_SENDMAC, MAC_TX_SENDDATA, MAC_TX_SENDCRC };
 
 //=============================================================================
@@ -58,26 +58,6 @@ static void mac_rx_process(
         vlan_hdr_rem  = 0;
         return;
     }
-
-    // MAC_RX_FLUSH: set rx.valid here (one pass after the buffer write
-    // in PAYLOAD), then go to IDLE. Do NOT read from stream.
-    if (state == MAC_RX_FLUSH) {
-        rx.valid        = true;
-        rx.ethertype    = saved_ethertype;
-        rx.dst_mac      = saved_dst_mac;
-        rx.src_mac      = saved_src_mac;
-        rx.is_broadcast = (saved_dst_mac == 0xFFFFFFFFFFFFULL);
-        rx.is_unicast   = (saved_dst_mac == 0x000A3501FEC0ULL);
-        state = MAC_RX_IDLE;
-        return;
-    }
-
-    rx.valid        = false;
-    rx.ethertype    = 0;
-    rx.src_mac      = 0;
-    rx.dst_mac      = 0;
-    rx.is_broadcast = false;
-    rx.is_unicast   = false;
 
     // Check if stream has data
     if (rx_stream.empty()) return;
@@ -167,18 +147,12 @@ static void mac_rx_process(
                     buffer[buf_wr_addr] = wr_word << ((4 - wr_byte) * 8);
                     buf_wr_addr++;
                 }
-                // FIX 2026-08-20: rx.valid is set in MAC_RX_FLUSH (next pass),
-                // guaranteeing the buffer write is committed before any layer
-                // reads the payload.
-                state = MAC_RX_FLUSH;
+                rx.ethertype = saved_ethertype;
+                rx.dst_mac   = saved_dst_mac;
+                rx.src_mac   = saved_src_mac;
+                rx.valid     = true;
+                state = MAC_RX_IDLE;
             }
-            break;
-
-        case MAC_RX_FLUSH:
-            // FIX 2026-08-20: one pass after the last buffer write.
-            // Set rx.valid here so the top-level dispatch processes the
-            // frame with the buffer write fully committed.
-            state = MAC_RX_IDLE;
             break;
 
         default:
