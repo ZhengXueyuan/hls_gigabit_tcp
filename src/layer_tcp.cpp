@@ -317,8 +317,10 @@ static void tcp_rx_process(bool rst, ip_rx_t &ip_rx, uint32_t *buf, mac_tx_req_t
         }
         return;
     }
-    // Parse TCP header
-    int tb=RX_BUFFER_BASE+5;uint8_t th[20];
+    // Parse TCP header — read from the buffer region this frame landed in
+    // (dual-buffer BUF_A / BUF_B; MAC RX alternates them per frame so a
+    // delayed frame's data is not clobbered by the next arrival).
+    int tb=ip_rx.buf_base+5;uint8_t th[20];
     for(int i=0;i<5;i++){uint32_t w=buf[tb+i];th[i*4]=(w>>24)&0xFF;th[i*4+1]=(w>>16)&0xFF;th[i*4+2]=(w>>8)&0xFF;th[i*4+3]=w&0xFF;}
     uint16_t sp=((uint16_t)th[0]<<8)|th[1],dp=((uint16_t)th[2]<<8)|th[3];
     uint32_t seq=((uint32_t)th[4]<<24)|((uint32_t)th[5]<<16)|((uint32_t)th[6]<<8)|th[7];
@@ -331,7 +333,7 @@ static void tcp_rx_process(bool rst, ip_rx_t &ip_rx, uint32_t *buf, mac_tx_req_t
     // for any plen up to that — a peer that ignores MSS=460 sends 536B
     // segments, which the old TCP_MSS(460)-wide buffer silently dropped.
     uint8_t payload[TCP_RX_PAYLOAD];
-    if(plen>0&&plen<=TCP_RX_PAYLOAD){int ps=tb+doff;for(int i=0;i<plen;i++){uint8_t wi=ps+(i>>2),bi=i&0x3;payload[i]=(buf[wi]>>((3-bi)*8))&0xFF;}}
+    if(plen>0&&plen<=TCP_RX_PAYLOAD){int ps=tb+doff;for(int i=0;i<plen;i++){uint16_t wi=ps+(i>>2),bi=i&0x3;payload[i]=(buf[wi]>>((3-bi)*8))&0xFF;}}
     int8_t cid=tcp_find(sp,ip_rx.src_ip);
     // FIX 2026-08-18: tcp_find() returns a free slot index (>=0) when no
     // connection matches, so the old `cid<0` test was never true and every

@@ -1174,3 +1174,136 @@ assign q0 = sel0_sr[0] ? q0_ram : 0;  // written=0 时返回 0
 - 未提交改动: run_vivado_phy1g2.tcl (BRAM 替换), buffer_bram_fix.v (新文件), run_hls.tcl (csim catch), PORT_NOTES.md
 - 下一轮入口: 等待 Vivado 构建完成 → 烧录 → 测试 2000B/4096B/8000B
 
+## 2026-08-22 — 第一阶段: 全链路使用 buf_base (任务)
+
+### 假设
+之前所有方案失败的根因: **读路径全部硬编码 `RX_BUFFER_BASE=0`**, MAC RX 的 `rx_buf_sel` 双缓冲虽在写端生效, 但读端没跟上 → 第 N 段被 FIFO 延迟处理期间, 第 N+1 段写入 BUF_B (没问题), 但当 FIFO 弹出第 N 段时, **buf_base 信息被丢弃** → 上层从 `buffer[0]` 读 → 拿到的是最新一段 (BUF_B) 的数据 → 错误集中在 payload 偏移 buffer[39] 附近 (即 4 段累积后, FIFO 弹出的旧帧读了新帧的位置)。
+
+### 修复方案 (第一阶段)
+让 `buf_base` 从 MAC RX 一路传递到 UDP/TCP/ICMP/ARP/DHCP:
+1. `layer_ip.cpp`: 从 `mac_rx.buf_base` 读 IP 头, 设 `ip_rx.buf_base = mac_rx.buf_base`
+2. `layer_udp.cpp`: 从 `ip_rx.buf_base + 5` 读 UDP 头, 设 `udp_rx.buf_base = ip_rx.buf_base`
+3. `layer_tcp.cpp`: `tb = ip_rx.buf_base + 5` 读 TCP 头 + payload
+4. `layer_icmp.cpp`: `icmp_base = ip_rx.buf_base + 5`
+5. `layer_arp.cpp`: 从 `mac_rx.buf_base` 读 ARP 包
+6. `layer_dhcp.cpp`: `DHCP_RX_BASE` 改为 `udp_rx.buf_base + 7`
+7. `udp_echo.cpp`: UDP echo copy 用 `rx_pbase = udp_rx.buf_base + 7`
+8. `layer_mac.cpp`: PAYLOAD 写地址上限保护 (不超 buf_base + BUF_SIZE), 防超长帧污染下一个 BUF
+
+### 不做
+- 第二阶段读控制器 (tcp_send_bufs 拷贝): 第一阶段验证通过就停手
+- 不改 MAC TX / FCS / 同步器
+- 不动 uart_hls (Latency 0/Interval 1 铁律保护范围外)
+
+## 2026-08-22 — 第一阶段#1 编译+烧录, 1608B 回归失败
+
+### 现象
+- ping 4/4 PASS
+- UDP echo 3/3 PASS
+- TCP 25B PASS
+- TCP 1608B FAIL @ offset 880 (原来是 PASS 的!)
+
+### 根因反解 (offset 880)
+- 880 = 536 + 344, 即第 2 段内偏移 344
+- 第 2 段在 BUF_B (base=160), payload word 起始 = 160+5+5=170
+- 344/4 = word 86 → 绝对地址 = 170 + 86 = 256 = **TX_SCRATCH_BASE**!
+- eth_types.h 的 buffer 分区: BUF_B [160..319] **与 TX_SCRATCH [256..319] 重叠**
+- ping 测试时 ICMP echo 写 TX_SCRATCH[0..N] = buffer[256..256+N], **覆盖了 BUF_B 的 payload 尾部**
+- 之前 1608B 能过是因为所有段都从 buffer[0] 读 (单缓冲), 不存在重叠问题
+
+### 修复 (第一阶段#2)
+扩大 BUFFER_DEPTH 到 768, 重新分区:
+- BUF_A      [0..159]   (不变)
+- BUF_B      [160..319] (不变)
+- TX_SCRATCH [320..383] (挪到 320, 64 字 = 256B, 够 ARP/ICMP/IGMP)
+- DHCP_FRAME [384..511] (DHCP 消息 300B = 75 字, 加 IP+UDP 7 字 = 82 字; 384+82=466 < 512 ✓)
+- TX_UDP     [512..767] (256 字 = 1024B, 容纳 576B 大帧 + 头部)
+
+DHCP_FRAME_BASE = TX_SCRATCH_BASE + 32 → 用新的 TX_SCRATCH_BASE=320 算出 = 352, 但
+DHCP 需要 82 字 → 352+82=434 > 383 越界。改 DHCP_FRAME_BASE 显式 = 384 (避开 TX_SCRATCH)。
+
+
+### 实测 (第一阶段#2, 768 分区后)
+- ping 4/4 PASS (ICMP 工作)
+- UDP echo 0/3 FAIL (timeout — 完全无响应!)
+- TCP 25B/1608B 完全连不上 (SYN 无响应)
+- UART console `?mac/?ip/?stat/?net` 全部正常 — FPGA 运行中, RX/TX 计数都在动
+- ARP 工作 (PC ARP 表有 192.168.100.2 → 00:0A:35:01:FE:C0)
+- 链路 1G OK
+
+**核心矛盾**: ICMP 工作但 UDP/TCP 完全无响应。说明:
+- MAC RX/TX、IP RX/ICMP、ARP、UART 都 OK
+- UDP 或 TCP 子系统被本次改动破坏
+
+**候选根因**:
+1. udp_rx_process 的 dst_port 校验时 buf_base 指向错位置 → 读到错误 dst_port → filter 失败
+2. udp_echo copy 循环把数据写到错误位置 → 上层后续读到错的 UDP payload
+3. tx_req 从 udp_tx_process 发出后 buffer[hdr_base + i] 写错位置 (TX_UDP_BASE=512, buf_len=IP_HEADER_BYTES+tx_data_len = 20+28=48 bytes = 12 words, 写到 buffer[512..523])
+
+**疑点**: ICMP echo 也是从 buffer[icmp_base+5] 读、写到 TX_SCRATCH_BASE, 然后 mac_tx_process 从 TX_SCRATCH_BASE 发出 — 这条路径没问题。
+UDP 路径差异: echo copy 在 udp_echo.cpp 主循环里, 读 buffer[rx_pbase..rx_pbase+pw] 写到 buffer[tx_pbase..tx_pbase+pw], 然后 udp_tx_process 从 buffer[TX_UDP_BASE..+7] 读 IP/UDP 头, 从 TX_UDP_BASE+7 起是 payload (echo copy 写入)。
+
+**假设 1**: 虽然 buf_base 逻辑对了, 但 mac_rx_process 里 rx.buf_base 赋值时 rx_buf_sel 已经被 toggle 了 → 错 buffer!
+看 layer_mac.cpp PAYLOAD end: `rx.buf_base = rx_buf_sel ? BUF_B_BASE : BUF_A_BASE; rx_buf_sel = !rx_buf_sel;` — 赋值在 toggle 前 ✓ 顺序对.
+
+**假设 2**: 双缓冲 FIFO 存了 mac_rx (含 buf_base), 但 pop 时用了 stale buf_base → proc_rx 的 buf_base 指向 BUF_B 但 buffer 实际数据在 BUF_A — 这是可能的! 当 mac_rx.valid 到来时 mac_tx_busy, push 到 FIFO (含 buf_base); 下一个 frame 到达时 rx_buf_sel 已切换, 新 frame 写到新 BUF; FIFO pop 出旧 mac_rx, ip_rx_process 用旧 buf_base 读 — 但旧 BUF 已被新 frame 覆盖 (如果新 frame 用同一个 BUF) — 不会, 双缓冲交替用.
+  但如果 FIFO 里有 2 个 entry (BUF_A + BUF_B 都满), 第 3 个 frame 来会写回 BUF_A → FIFO[0] (buf_base=A) 读到的是新数据.
+
+**假设 3**: 新分区下 DHCP_TX (在 tx_req.request 的空隙) 用 DHCP_FRAME_BASE=384 写 buffer, 如果 DHCP 与 RX BUF_A 在同一时间被访问, 会不会时序竞争?
+  DHCP_FRAME_BASE=384 在 [384..511] 独立区, 不冲突.
+
+**下一步**:
+- 在 udp_rx_process 里加统计计数器, 看看到底有没有收到 dst_port=8080 的 UDP 包
+- 用 pktmon 抓包验证 FPGA 是否真没回
+- 或直接反汇编生成的 Verilog, 找 buffer 地址总线是否真的支持 768 字
+
+---
+
+## 2026-08-22 深夜 — 双缓冲回归根因破案: ap_uint<9> 地址位宽截断 (TL 修复)
+
+### 现象 (768 分区后)
+- ping 4/4 PASS, 但 UDP echo 0/3 全 FAIL, TCP SYN 无响应, ARP/ICMP/UART/链路全正常
+- "ICMP 通但 UDP/TCP 全挂" 这个组合是关键线索
+
+### 根因 (TL 锁定)
+agent 把 TX_UDP_BASE 挪到 512 (768 分区), 但**全工程 buffer 地址字段是 ap_uint<9> (最大 511)**:
+- `mac_tx_process` 的 `req_wbase` (ap_uint<9>) 接收 `tx_req.buf_addr = TX_UDP_BASE = 512`
+- 512 = 0b1000000000 需 10 bit → ap_uint<9> 截断成 **0**
+- mac_tx 从 buffer[0] (RX BUF_A) 而非 buffer[512] 读 → 发出 RX 帧垃圾 → UDP/TCP 全废
+- **ICMP 用 TX_SCRATCH_BASE=320 (<512 装得下) 所以正常** — 完美解释组合现象
+
+### 修复 (TL 直接改, 6 处 ap_uint<9> → ap_uint<10>)
+- eth_types.h: udp_rx_t.buf_base (其余 buf_base/buf_addr agent 已改 10)
+- layer_mac.cpp: buf_wr_addr / buf_limit / req_wbase
+- layer_ip.cpp: base; layer_arp.cpp: base
+- grep 确认无 ap_uint<9> 残留
+
+### 教训
+- 改 buffer 分区地址时**必须同步检查所有地址字段/变量的位宽** (BUFFER_DEPTH 512→768 需 9→10 bit)
+- "部分协议通、部分不通"时, 按各协议用的地址区间对比最快定位 (ICMP=320 通 / UDP=512 不通 → 512 溢出)
+
+### 第二阶段修复 (TL): 移除 4-FIFO, frame_done 当拍立即处理
+位宽修复后 ping/UDP/25B PASS, 但 1608/2000B 仍确定性 FAIL:
+- 错@880 rx=45 00 02 40 (IP头 len=576) / 错@344 rx=45 00 00 28 (IP头 len=40)
+- 反解: 回显里混入"另一段的 IP 头"。4-FIFO 只存元数据不存 payload,
+  双缓冲只保护 1 帧; 4 段突发时 FIFO 积压, 弹出时其 buf_base 指向的 BUF
+  已被"隔一帧"的新段覆盖 (S2→BUF_B, S4 也→BUF_B 覆盖 S2)。
+- 修复: 移除 4-FIFO, mac_rx.valid 当拍立即处理。TCP 数据路走 tcp_queue
+  (payload 立即拷入独立 tcp_send_bufs BRAM, busy 安全, 不碰共享 TX 区),
+  payload 在 frame_done 当拍就被提走, 下一帧 (>=22 pass) 来不及覆盖。
+
+### 2000B 真根因破案 (TL): layer_tcp.cpp payload 读取 `uint8_t wi` 溢出
+移除 FIFO 后 1608/2000B 仍同样错@344/880 (rx=45 00 .. = IP头)。逐位反解:
+- payload 读循环 `uint8_t wi = ps+(i>>2)`, ps=tb+doff=buf_base+10
+- **BUF_B 时 ps=170, i=344 → wi=256 → uint8_t 回绕成 0** → 读 buf[0]=BUF_A 里
+  刚到的帧的 IP 头 → 回显混入 IP 头。错误固定在 wi 首次溢出处(344), 值总是 IP 头。
+- 单缓冲时代 buf_base=0, ps=10, wi<=153 不溢出 — 这是启用双缓冲引入的**第二处**
+  "窄类型假设 buf_base=0" bug (与 ap_uint<9 同类)。
+- 修复: `uint8_t wi` → `uint16_t wi` (layer_tcp.cpp:336)。
+
+### 进展: 1608B PASS! 2000B 进到第4段移位竞态
+uint8_t wi 修复后板测:
+- ping/UDP 64/512/TCP 25B/**1608B 全 PASS**
+- 2000B 仍 FAIL 但错误模式质变: @1722-1723 (第4段内偏移114), **每次漂移**,
+  rx 变成 payload 乱序/移位 (不再是 IP头) → 读路径修好, 剩第4段移位竞态
+- 即原先记载的 1726 竞态 (buffer[39] 同周期读写移位, HLS 调度非确定)

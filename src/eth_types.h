@@ -123,26 +123,36 @@ struct gmii_byte_t {
 #define DEFAULT_IP_TOTAL_LEN   (IP_HEADER_BYTES + DEFAULT_UDP_LENGTH)    // 48
 
 //=============================================================================
-// Buffer partitioning
+// Buffer partitioning — dual-buffer dual-region layout
 //=============================================================================
 // Dual-buffer for MAC RX: alternating frames land in BUF_A / BUF_B so that
 // MAC RX writing and layer processing never touch the same region.
-#define BUFFER_DEPTH        512
+//
+// 2026-08-22: original 512-word layout had BUF_B[160..319] overlapping
+// TX_SCRATCH_BASE[256..319] — an ICMP/ARP/IGMP reply would clobber the
+// tail of a BUF_B-resident TCP segment (observed as TCP 1608B failure at
+// payload offset 880, absolute word 256 = TX_SCRATCH_BASE). Enlarge the
+// buffer to 768 words and give each region its own disjoint space:
+//
+//   BUF_A       [0..159]    160 words (640B) — fits 536B TCP seg + 40B hdrs
+//   BUF_B       [160..319]  160 words (640B)
+//   TX_SCRATCH  [320..383]   64 words (256B) — ARP/ICMP/IGMP scratch
+//   DHCP_FRAME  [384..511]  128 words (512B) — DHCP IP+UDP+msg (~82 words)
+//   TX_UDP      [512..767]  256 words (1024B) — UDP/TCP TX frame (576B max)
+#define BUFFER_DEPTH        768
 #define BUF_A_BASE          0
 #define BUF_B_BASE          160
 #define BUF_SIZE            160   // 640B — fits max TCP segment (536B + headers)
 #define RX_BUFFER_BASE      0
 #define RX_BUFFER_SIZE      BUF_SIZE
-#define TX_SCRATCH_BASE     256   // ARP/ICMP/IGMP TX frame scratch area
-#define TX_SCRATCH_SIZE     64    // 256..319
-// FIX 2026-08-19: TX_UDP_BASE moved down from 384 so a single 536B TCP segment
-// (Windows ignores the MSS=460 advert) fits in ONE TX frame: 20 IP + 20 TCP +
-// 536 payload = 576B = 144 words. Region 320..512 = 192 words = 768B (48-word
-// margin). Word 256 (=TX_SCRATCH_BASE) is deliberately avoided: ARP/ICMP reply
-// builders write there ungated, so a TCP frame in flight would be clobbered.
-// Overlap with the DHCP TX region (288..369) is guarded by tx_req arbitration.
-#define TX_UDP_BASE         320   // UDP/TCP TX payload area
-#define TX_UDP_SIZE         192   // 320..512 = 768B, fits the 576B max TCP frame
+#define TX_SCRATCH_BASE     320   // ARP/ICMP/IGMP TX frame scratch area
+#define TX_SCRATCH_SIZE     64    // 320..383
+// TX_UDP_BASE at 512 so a single 536B TCP segment (Windows ignores the
+// MSS=460 advert) fits in ONE TX frame: 20 IP + 20 TCP + 536 payload = 576B
+// = 144 words. Region 512..768 = 256 words = 1024B (ample margin). Disjoint
+// from both RX buffers and the DHCP region, so no mid-send clobbering.
+#define TX_UDP_BASE         512   // UDP/TCP TX payload area
+#define TX_UDP_SIZE         256   // 512..767
 
 //=============================================================================
 // Timing
@@ -177,7 +187,7 @@ struct mac_rx_t {
     bool        is_broadcast;   // dst MAC == FF:FF:FF:FF:FF:FF
     bool        is_unicast;     // dst MAC == board MAC
     bool        valid;          // frame passed MAC filter
-    ap_uint<9>  buf_base;       // which buffer region this frame landed in
+    ap_uint<10> buf_base;       // which buffer region this frame landed in
 };
 
 //=============================================================================
@@ -186,7 +196,7 @@ struct mac_rx_t {
 struct mac_tx_req_t {
     mac_addr_t  dst_mac;
     ap_uint<16> ethertype;
-    ap_uint<9>  buf_addr;       // start address in shared buffer (word index)
+    ap_uint<10> buf_addr;       // start address in shared buffer (word index)
     ap_uint<16> buf_len;        // bytes to send (not including CRC)
     bool        request;
     bool        insert_vlan;    // insert 802.1Q VLAN tag in TX frame
@@ -206,7 +216,7 @@ struct ip_rx_t {
     ap_uint<16> id;             // IP identification
     bool        checksum_ok;
     bool        valid;
-    ap_uint<9>  buf_base;       // buffer region for this IP packet
+    ap_uint<10> buf_base;       // buffer region for this IP packet
 };
 
 //=============================================================================
@@ -257,7 +267,7 @@ struct udp_rx_t {
     ap_uint<16> checksum;
     ap_uint<16> payload_len;    // actual payload bytes
     bool        valid;
-    ap_uint<9>  buf_base;       // buffer region for this UDP datagram
+    ap_uint<10> buf_base;       // buffer region for this UDP datagram
 };
 
 #endif // ETH_TYPES_H

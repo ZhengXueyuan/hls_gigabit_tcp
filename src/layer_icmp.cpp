@@ -54,9 +54,8 @@ static void icmp_rx_process(
     if (!ip_rx.valid) return;
     if (ip_rx.protocol != IP_PROTO_ICMP) return;
 
-    // ICMP header starts after 20-byte IP header
-    // Buffer word index: RX_BUFFER_BASE + 5 (IP_HDR_WORDS)
-    int icmp_base = RX_BUFFER_BASE + 5;
+    // ICMP header starts after 20-byte IP header (5 words from buf_base)
+    int icmp_base = ip_rx.buf_base + 5;
 
     // Read first 8 bytes of ICMP header
     uint8_t icmp_hdr[8];

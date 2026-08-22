@@ -30,15 +30,18 @@ static void ip_rx_process(
     ip_rx.ttl         = 0;
     ip_rx.id          = 0;
     ip_rx.hdr_checksum = 0;
+    ip_rx.buf_base    = 0;
 
     if (!reset_n) return;
     if (!mac_rx.valid) return;
     if (mac_rx.ethertype != ETHERTYPE_IPV4) return;
 
-    // Read IP header bytes (20 bytes = 5 words)
+    // Read IP header bytes (20 bytes = 5 words) from the buffer region
+    // this frame landed in (dual-buffer BUF_A / BUF_B selected by MAC RX).
+    ap_uint<10> base = mac_rx.buf_base;
     uint8_t hdr[20];
     for (int i = 0; i < 5; i++) {
-        uint32_t w = buffer[RX_BUFFER_BASE + i];
+        uint32_t w = buffer[base + i];
         hdr[i*4 + 0] = (w >> 24) & 0xFF;
         hdr[i*4 + 1] = (w >> 16) & 0xFF;
         hdr[i*4 + 2] = (w >> 8)  & 0xFF;
@@ -76,5 +79,6 @@ static void ip_rx_process(
 
     if (ip_rx.dst_ip == board_ip || ip_rx.dst_ip == broadcast_ip) {
         ip_rx.valid = ip_rx.checksum_ok;
+        ip_rx.buf_base = mac_rx.buf_base;   // propagate buffer region to next layer
     }
 }

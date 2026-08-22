@@ -13,12 +13,15 @@
 
 // DHCP TX frame layout in the shared buffer (contiguous, 82 words):
 //   IPv4 header (5 words) + UDP header (2 words) + DHCP message (75 words)
-// Frame base sits past the ARP/IGMP scratch area (TX_SCRATCH_BASE..+7) so
-// concurrent ARP/IGMP replies can't corrupt a frame mid-transmission.
+// 2026-08-22: with the enlarged 768-word buffer, DHCP gets its own disjoint
+// 128-word region at 384..511 (was TX_SCRATCH_BASE+32 = 288, which
+// overlapped BUF_B after the dual-buffer rework).
 #define DHCP_BUF_WORDS   75
-#define DHCP_FRAME_BASE  (TX_SCRATCH_BASE + 32)
-#define DHCP_BUF_BASE    (DHCP_FRAME_BASE + 7)   // DHCP message follows IP+UDP headers
-#define DHCP_RX_BASE     (RX_BUFFER_BASE + 7)    // received DHCP message (20B IP + 8B UDP)
+#define DHCP_FRAME_BASE  384                          // dedicated DHCP region
+#define DHCP_BUF_BASE    (DHCP_FRAME_BASE + 7)        // DHCP message follows IP+UDP headers
+// DHCP_RX_BASE: replaced by udp_rx.buf_base + 7 inside dhcp_rx_process so the
+// DHCP message is read from the buffer region the frame actually landed in
+// (dual-buffer BUF_A/BUF_B alternation driven by MAC RX).
 
 //=============================================================================
 // Write DHCP fixed header to buffer
@@ -154,14 +157,16 @@ static void dhcp_rx_process(
     if (udp_rx.dst_port != DHCP_CLIENT_PORT) return;
 
     // Read DHCP message type from options (message is in the RX buffer,
-    // right after the 20-byte IP header + 8-byte UDP header)
+    // right after the 20-byte IP header + 8-byte UDP header). Base comes
+    // from udp_rx.buf_base (dual-buffer BUF_A/BUF_B).
+    int rx_base = udp_rx.buf_base + 7;
     uint8_t msg_type = 0;
-    dhcp_read_opt(buffer, DHCP_RX_BASE, udp_rx.payload_len, 53, &msg_type);
+    dhcp_read_opt(buffer, rx_base, udp_rx.payload_len, 53, &msg_type);
 
     if (dhcp_state == DHCP_WAIT_OFFER && msg_type == DHCP_MSG_OFFER) {
-        offered_ip = buffer[DHCP_RX_BASE + 4];  // yiaddr at word offset 4
+        offered_ip = buffer[rx_base + 4];  // yiaddr at word offset 4
         uint8_t srv[4];
-        if (dhcp_read_opt(buffer, DHCP_RX_BASE, udp_rx.payload_len, 54, srv)) {
+        if (dhcp_read_opt(buffer, rx_base, udp_rx.payload_len, 54, srv)) {
             server_ip = ((uint32_t)srv[0]<<24)|((uint32_t)srv[1]<<16)|((uint32_t)srv[2]<<8)|srv[3];
         }
         dhcp_state = DHCP_REQUEST;

@@ -49,8 +49,8 @@ static void igmp_rx_process(
     if (!ip_rx.valid) return;
     if (ip_rx.protocol != IP_PROTO_IGMP) return;
 
-    // IGMP header at buffer[RX_BUFFER_BASE + 5] (only 2 words = 8 bytes)
-    int igmp_base = RX_BUFFER_BASE + 5;
+    // IGMP header at buffer[ip_rx.buf_base + 5] (only 2 words = 8 bytes)
+    int igmp_base = ip_rx.buf_base + 5;
     uint8_t igmp[8];
     for (int i = 0; i < 2; i++) {
         uint32_t w = buffer[igmp_base + i];

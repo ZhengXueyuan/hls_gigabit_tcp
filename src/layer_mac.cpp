@@ -31,7 +31,7 @@ static void mac_rx_process(
     static ap_uint<16> saved_ethertype = 0;
     static mac_addr_t  saved_dst_mac   = 0;
     static mac_addr_t  saved_src_mac   = 0;
-    static ap_uint<9>  buf_wr_addr = RX_BUFFER_BASE;
+    static ap_uint<10> buf_wr_addr = RX_BUFFER_BASE;
     static uint32_t wr_word      = 0;
     static uint8_t  wr_byte      = 0;
     static uint8_t  vlan_hdr_rem = 0;    // remaining VLAN tag bytes to skip
@@ -135,28 +135,38 @@ static void mac_rx_process(
 
         case MAC_RX_PAYLOAD:
             // Accumulate into 32-bit word, write to buffer when full
-            wr_word = (wr_word << 8) | data;
-            wr_byte++;
-            if (wr_byte == 4) {
-                buffer[buf_wr_addr] = wr_word;
-                buf_wr_addr++;
-                wr_byte = 0;
-                wr_word = 0;
-            }
-
-            if (last) {
-                // End of frame — flush partial word
-                if (wr_byte > 0) {
-                    buffer[buf_wr_addr] = wr_word << ((4 - wr_byte) * 8);
-                    buf_wr_addr++;
+            // Overflow guard: never write past the end of this BUF region
+            // (would otherwise bleed into BUF_B / TX scratch and corrupt
+            // an unrelated frame that happens to live there).
+            {
+                ap_uint<10> buf_limit = (rx_buf_sel ? BUF_B_BASE : BUF_A_BASE) + BUF_SIZE;
+                wr_word = (wr_word << 8) | data;
+                wr_byte++;
+                if (wr_byte == 4) {
+                    if (buf_wr_addr < buf_limit) {
+                        buffer[buf_wr_addr] = wr_word;
+                        buf_wr_addr++;
+                    }
+                    wr_byte = 0;
+                    wr_word = 0;
                 }
-                rx.ethertype = saved_ethertype;
-                rx.dst_mac   = saved_dst_mac;
-                rx.src_mac   = saved_src_mac;
-                rx.valid     = true;
-                rx.buf_base  = rx_buf_sel ? BUF_B_BASE : BUF_A_BASE;
-                rx_buf_sel   = !rx_buf_sel;
-                state = MAC_RX_IDLE;
+
+                if (last) {
+                    // End of frame — flush partial word
+                    if (wr_byte > 0) {
+                        if (buf_wr_addr < buf_limit) {
+                            buffer[buf_wr_addr] = wr_word << ((4 - wr_byte) * 8);
+                            buf_wr_addr++;
+                        }
+                    }
+                    rx.ethertype = saved_ethertype;
+                    rx.dst_mac   = saved_dst_mac;
+                    rx.src_mac   = saved_src_mac;
+                    rx.valid     = true;
+                    rx.buf_base  = rx_buf_sel ? BUF_B_BASE : BUF_A_BASE;
+                    rx_buf_sel   = !rx_buf_sel;
+                    state = MAC_RX_IDLE;
+                }
             }
             break;
 
@@ -183,7 +193,7 @@ static void mac_tx_process(
     static uint32_t crc_reg       = 0xFFFFFFFF;
     static mac_addr_t  dst_mac    = 0;
     static ap_uint<16> ethertype  = 0;
-    static ap_uint<9>  req_wbase  = 0;
+    static ap_uint<10> req_wbase  = 0;
     static ap_uint<16> req_bytes  = 0;
     static bool        do_vlan    = false;
     static ap_uint<16> vlan_tci   = 0;

@@ -26,13 +26,14 @@ static void udp_rx_process(
     udp_rx.length   = 0;
     udp_rx.checksum = 0;
     udp_rx.payload_len = 0;
+    udp_rx.buf_base = 0;
 
     if (!reset_n) return;
     if (!ip_rx.valid) return;
     if (ip_rx.protocol != IP_PROTO_UDP) return;
 
-    // UDP header starts after 20-byte IP header = 5 words from RX base
-    int udp_base = RX_BUFFER_BASE + 5;
+    // UDP header starts after 20-byte IP header (5 words from this frame's buf_base)
+    int udp_base = ip_rx.buf_base + 5;
 
     uint8_t udp_hdr[8];
     for (int i = 0; i < 2; i++) {
@@ -54,6 +55,7 @@ static void udp_rx_process(
     // Calculate actual payload length
     uint16_t payload_len = udp_rx.length - UDP_HEADER_BYTES;
     udp_rx.payload_len = payload_len;
+    udp_rx.buf_base    = ip_rx.buf_base;   // propagate buffer region to DHCP/echo
     udp_rx.valid = true;
 }
 

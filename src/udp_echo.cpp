@@ -60,13 +60,6 @@ void udp_echo(
     static ap_uint<32> rx_src_ip  = 0;
     static bool     init_done     = false;
 
-    // Conditional delay FIFO: 4 entries
-    static mac_rx_t rx_fifo[4];
-    static uint8_t  rx_fifo_wr = 0, rx_fifo_rd = 0, rx_fifo_cnt = 0;
-    #pragma HLS RESET variable=rx_fifo_wr
-    #pragma HLS RESET variable=rx_fifo_rd
-    #pragma HLS RESET variable=rx_fifo_cnt
-
     // DHCP state (Phase 5)
     static uint8_t  dhcp_state   = DHCP_IDLE;
     static uint32_t dhcp_xid     = 0;
@@ -94,9 +87,6 @@ void udp_echo(
         dhcp_timer     = 0;
         dhcp_start     = false;
         dhcp_delay     = 0;
-        rx_fifo_wr     = 0;
-        rx_fifo_rd     = 0;
-        rx_fifo_cnt    = 0;
     } else {
         // One-time init
         if (!init_done) {
@@ -123,14 +113,18 @@ void udp_echo(
     ip_rx.valid = false;
     udp_rx.valid = false;
 
+    // Process EVERY frame in the SAME pass it completes (mac_rx.valid).
+    // The old 4-entry FIFO deferred processing when the MAC TX was busy, but
+    // it saved only the mac_rx METADATA — the payload stayed in BUF_A/BUF_B.
+    // With dual-buffer a BUF is reused every OTHER frame, so a burst deeper
+    // than 2 overwrote a still-queued frame's payload (deterministic 2000B
+    // corruption: a later segment's IP header surfaced mid-payload). Immediate
+    // processing is safe now: the TCP data path uses tcp_queue (always copies
+    // the payload into the private tcp_send_bufs BRAM, never touches the
+    // shared TX region), so the payload is lifted out at frame_done — long
+    // before the next frame (>=~22 passes away) can overwrite this BUF.
     mac_rx_t proc_rx; bool do_process = false;
-    if (mac_rx.valid) {
-        if (mac_tx_busy || tx_req.request) {
-            if (rx_fifo_cnt < 4) { rx_fifo[rx_fifo_wr]=mac_rx; rx_fifo_wr=(rx_fifo_wr+1)&3; rx_fifo_cnt++; }
-        } else { proc_rx=mac_rx; do_process=true; }
-    } else if (!mac_tx_busy && !tx_req.request && rx_fifo_cnt > 0) {
-        proc_rx=rx_fifo[rx_fifo_rd]; rx_fifo_rd=(rx_fifo_rd+1)&3; rx_fifo_cnt--; do_process=true;
-    }
+    if (mac_rx.valid) { proc_rx = mac_rx; do_process = true; }
     if (do_process) {
         if (proc_rx.ethertype == ETHERTYPE_ARP) {
             arp_rx_process(reset_n, proc_rx, buffer, tx_req, NULL);
@@ -151,8 +145,9 @@ void udp_echo(
                             dhcp_rx_process(reset_n, udp_rx, buffer, dhcp_state, dhcp_xid,
                                            dhcp_offered, dhcp_server, dhcp_timer, dhcp_start);
                         } else {
-                            // Copy payload for echo
-                            int rx_pbase = RX_BUFFER_BASE + 7;
+                            // Copy payload for echo — read from the buffer
+                            // region this frame landed in (BUF_A / BUF_B).
+                            int rx_pbase = udp_rx.buf_base + 7;
                             int tx_pbase = TX_UDP_BASE + 7;
                             uint16_t pw = (udp_rx.payload_len + 3) >> 2;
                             for (int i = 0; i < pw; i++) {
