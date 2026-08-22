@@ -49,11 +49,11 @@ static void igmp_rx_process(
     if (!ip_rx.valid) return;
     if (ip_rx.protocol != IP_PROTO_IGMP) return;
 
-    // IGMP header at buffer[ip_rx.buf_base + 5] (only 2 words = 8 bytes)
-    int igmp_base = ip_rx.buf_base + 5;
+    // IGMP header at word 5 of the staged frame (only 2 words = 8 bytes)
+    int igmp_base = 5;
     uint8_t igmp[8];
     for (int i = 0; i < 2; i++) {
-        uint32_t w = buffer[igmp_base + i];
+        uint32_t w = frame_buf[igmp_base + i];
         igmp[i*4 + 0] = (w >> 24) & 0xFF;
         igmp[i*4 + 1] = (w >> 16) & 0xFF;
         igmp[i*4 + 2] = (w >> 8)  & 0xFF;

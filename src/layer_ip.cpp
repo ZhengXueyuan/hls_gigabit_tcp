@@ -36,12 +36,12 @@ static void ip_rx_process(
     if (!mac_rx.valid) return;
     if (mac_rx.ethertype != ETHERTYPE_IPV4) return;
 
-    // Read IP header bytes (20 bytes = 5 words) from the buffer region
-    // this frame landed in (dual-buffer BUF_A / BUF_B selected by MAC RX).
-    ap_uint<10> base = mac_rx.buf_base;
+    // Read IP header bytes (20 bytes = 5 words) from the staged frame buffer.
+    // udp_echo already popped this frame from frame_fifo into frame_buf;
+    // frame_buf[0] is the first payload word (start of the IP packet).
     uint8_t hdr[20];
     for (int i = 0; i < 5; i++) {
-        uint32_t w = buffer[base + i];
+        uint32_t w = frame_buf[i];
         hdr[i*4 + 0] = (w >> 24) & 0xFF;
         hdr[i*4 + 1] = (w >> 16) & 0xFF;
         hdr[i*4 + 2] = (w >> 8)  & 0xFF;

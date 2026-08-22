@@ -1307,3 +1307,47 @@ uint8_t wi 修复后板测:
 - 2000B 仍 FAIL 但错误模式质变: @1722-1723 (第4段内偏移114), **每次漂移**,
   rx 变成 payload 乱序/移位 (不再是 IP头) → 读路径修好, 剩第4段移位竞态
 - 即原先记载的 1726 竞态 (buffer[39] 同周期读写移位, HLS 调度非确定)
+
+---
+
+## 2026-08-23 — RX 通路 hls::stream 化重构 (UG1399 官方模式, 根治竞态)
+
+### 依据 (用户提出 + 联网查证)
+UG1399: **绝不在并发生产者/消费者间共享裸数组**, 用 hls::stream (FIFO) 或
+stream_of_blocks。我们的 RX 帧访问本来就是顺序的 (IP头→TCP/UDP头→payload),
+完美匹配 stream。
+
+### 重构方案 (TL 实施)
+- **生产者**: mac_rx_process 把接收帧的字推入 `hls::stream<uint32_t> frame_fifo`
+  (深度512, 函数内static), 不再写共享 buffer; 记录帧字数 mac_rx.nwords。
+- **暂存**: udp_echo 在 mac_rx.valid 当拍 pop nwords 字到全局 `frame_buf[400]`
+  (私有, 单拍内写后读, 无竞态), 超限 drain 保持 FIFO 帧对齐。
+- **消费者**: 各层 RX 读改为 `frame_buf[0基偏移]` (IP头@0, TCP/UDP/ICMP@5,
+  ARP@0, DHCP@7), 解析逻辑不变; TX 写仍走共享 buffer (TX专用, 无竞态)。
+- 共享 buffer[] 变为 TX-only, 彻底切断 RX 读写与 TX 的相互干扰。
+
+### 关键: 这不是"所有 HLS BRAM 都有风险"
+正常 HLS 代码依赖分析保证 C 语义, 安全。风险来自本工程的反模式: 共享数组 +
+ap_ctrl_none 自由运行 + "1call=1clk"脑内模型 + 无显式同步。重构=回到官方 stream 模式。
+
+### 仿真验证 (用户要求: 下载慢, 优先多仿真)
+- csynth: 通过。frame_fifo(512深)/frame_buf(400字) 正确生成, BRAM 3% LUT 20%。
+- csim: 全测试 0 errors, 2000B 测试 recv_total=2000 无 payload mismatch,
+  hls::stream 实测最大深度 144 (=一段) → 逻辑功能正确。
+- **cosim (RTL协同仿真)**: 进行中 — 只有它能复现 RTL 并发竞态 (csim 是顺序C++复现不了)。
+
+### cosim 受限说明
+cosim_design 报错: "Cosim only supports ap_ctrl_none designs that are (1) combinational
+(2) pipelined II=1 (3) array/hls/axi stream ports" — 本工程是自由运行多周期 FSM,
+不在其列 (工具硬限制, 非代码问题)。故 RTL 级竞态无法 cosim 验证, 只能靠板级。
+但重构已从结构上消除竞态根因 (共享RX数组→带握手FIFO), csim 已证逻辑正确。
+
+### 板测结果 (stream 重构后): 2000B 第4段仍 FAIL — RX 假设被证伪
+- ping/UDP/25B/1608B PASS (无回归); 2000B 3次仍 FAIL @1738-1739 (乱序, 4th段)
+- **关键**: 错误位置从 ~1722 移到 ~1739 → 重构改变了时序, 但竞态仍在。
+- **结论: "RX 共享buffer竞态"假设证伪**。三种完全不同 RX 架构 (双缓冲/去FIFO/
+  stream) 都在第4段同一相对位置失败 → 病根不在 RX 缓冲。
+- **修正假设**: 竞态在 **TX 队列 tcp_send_bufs** — tcp_queue(写) 与 tcp_maintenance
+  (读) 并发操作同一 tcp_send_bufs[cid] 数组 (同类反模式, 在TX侧, 重构未触及)。
+  第4段才出错 = 此时队列正被边读边写。
+- 教训: 连续多架构同点失败时, 应早怀疑假设本身, 而不是继续在同方向加架构。

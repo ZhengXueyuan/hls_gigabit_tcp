@@ -20,7 +20,7 @@ enum { MAC_TX_IDLE, MAC_TX_SEND55, MAC_TX_SENDMAC, MAC_TX_SENDDATA, MAC_TX_SENDC
 static void mac_rx_process(
     bool                      reset_n,
     hls::stream<gmii_byte_t> &rx_stream,
-    uint32_t                 *buffer,
+    hls::stream<uint32_t>    &frame_fifo,   // out: frame payload words (race-free)
     mac_rx_t                 &rx
 ) {
     static uint8_t  state        = MAC_RX_IDLE;
@@ -31,11 +31,10 @@ static void mac_rx_process(
     static ap_uint<16> saved_ethertype = 0;
     static mac_addr_t  saved_dst_mac   = 0;
     static mac_addr_t  saved_src_mac   = 0;
-    static ap_uint<10> buf_wr_addr = RX_BUFFER_BASE;
     static uint32_t wr_word      = 0;
     static uint8_t  wr_byte      = 0;
+    static ap_uint<10> nwords    = 0;    // words pushed this frame
     static uint8_t  vlan_hdr_rem = 0;    // remaining VLAN tag bytes to skip
-    static bool     rx_buf_sel   = false; // dual-buffer: false=BUF_A, true=BUF_B
 
     rx.valid        = false;
     rx.ethertype    = 0;
@@ -44,6 +43,7 @@ static void mac_rx_process(
     rx.is_broadcast = false;
     rx.is_unicast   = false;
     rx.buf_base     = 0;
+    rx.nwords       = 0;
 
     if (!reset_n) {
         state         = MAC_RX_IDLE;
@@ -54,11 +54,10 @@ static void mac_rx_process(
         saved_ethertype = 0;
         saved_dst_mac   = 0;
         saved_src_mac   = 0;
-        buf_wr_addr   = RX_BUFFER_BASE;
         wr_word       = 0;
         wr_byte       = 0;
+        nwords        = 0;
         vlan_hdr_rem  = 0;
-        rx_buf_sel    = false;
         return;
     }
 
@@ -75,9 +74,9 @@ static void mac_rx_process(
             dst_mac_acc  = 0;
             src_mac_acc  = 0;
             eth_acc      = 0;
-            buf_wr_addr  = rx_buf_sel ? BUF_B_BASE : BUF_A_BASE;
             wr_word      = 0;
             wr_byte      = 0;
+            nwords       = 0;
             vlan_hdr_rem = 0;
             if (data == 0x55) { state = MAC_RX_PREAMBLE; byte_cnt = 1; }
             break;
@@ -134,19 +133,17 @@ static void mac_rx_process(
             break;
 
         case MAC_RX_PAYLOAD:
-            // Accumulate into 32-bit word, write to buffer when full
-            // Overflow guard: never write past the end of this BUF region
-            // (would otherwise bleed into BUF_B / TX scratch and corrupt
-            // an unrelated frame that happens to live there).
+            // Accumulate into 32-bit word, push to the frame FIFO. The FIFO
+            // decouples producer (here) from consumer (protocol layers) with a
+            // proper handshake — this is the race-free replacement for the old
+            // shared buffer[] (UG1399: never share a raw array between
+            // concurrent producer/consumer). Deep enough to hold a max frame.
             {
-                ap_uint<10> buf_limit = (rx_buf_sel ? BUF_B_BASE : BUF_A_BASE) + BUF_SIZE;
                 wr_word = (wr_word << 8) | data;
                 wr_byte++;
                 if (wr_byte == 4) {
-                    if (buf_wr_addr < buf_limit) {
-                        buffer[buf_wr_addr] = wr_word;
-                        buf_wr_addr++;
-                    }
+                    frame_fifo.write(wr_word);
+                    nwords++;
                     wr_byte = 0;
                     wr_word = 0;
                 }
@@ -154,17 +151,14 @@ static void mac_rx_process(
                 if (last) {
                     // End of frame — flush partial word
                     if (wr_byte > 0) {
-                        if (buf_wr_addr < buf_limit) {
-                            buffer[buf_wr_addr] = wr_word << ((4 - wr_byte) * 8);
-                            buf_wr_addr++;
-                        }
+                        frame_fifo.write(wr_word << ((4 - wr_byte) * 8));
+                        nwords++;
                     }
                     rx.ethertype = saved_ethertype;
                     rx.dst_mac   = saved_dst_mac;
                     rx.src_mac   = saved_src_mac;
                     rx.valid     = true;
-                    rx.buf_base  = rx_buf_sel ? BUF_B_BASE : BUF_A_BASE;
-                    rx_buf_sel   = !rx_buf_sel;
+                    rx.nwords    = nwords;
                     state = MAC_RX_IDLE;
                 }
             }

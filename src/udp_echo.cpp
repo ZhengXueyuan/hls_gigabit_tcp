@@ -21,6 +21,11 @@
 #include "layer_tcp.cpp"
 #include "layer_stats.cpp"
 
+// Per-frame staging buffer (global; layers read it at 0-based offsets). See
+// eth_types.h. The frame FIFO feeding it is a static inside udp_echo below.
+uint32_t frame_buf[FRAME_BUF_WORDS];
+
+
 void udp_echo(
     bool                      reset_n,
     hls::stream<gmii_byte_t> &rx_stream,
@@ -44,6 +49,11 @@ void udp_echo(
     // Shared resources
     static uint32_t    buffer[BUFFER_DEPTH];
     #pragma HLS RESOURCE variable=buffer core=RAM_2P_BRAM
+
+    // Race-free RX frame FIFO: MAC RX pushes frame words, udp_echo stages
+    // them into frame_buf. Replaces the shared RX buffer (UG1399 stream).
+    static hls::stream<uint32_t> frame_fifo;
+    #pragma HLS STREAM variable=frame_fifo depth=512
 
     // TX request from upper layers to MAC TX
     static mac_tx_req_t tx_req;
@@ -107,7 +117,7 @@ void udp_echo(
 
     // Always call layers (they handle reset internally)
     bool mac_tx_busy = false;
-    mac_rx_process(reset_n, rx_stream, buffer, mac_rx);
+    mac_rx_process(reset_n, rx_stream, frame_fifo, mac_rx);
     mac_tx_process(reset_n, tx_req, buffer, tx_stream, mac_tx_busy);
 
     ip_rx.valid = false;
@@ -126,6 +136,15 @@ void udp_echo(
     mac_rx_t proc_rx; bool do_process = false;
     if (mac_rx.valid) { proc_rx = mac_rx; do_process = true; }
     if (do_process) {
+        // Stage the whole frame from the race-free FIFO into frame_buf.
+        // The layers then parse frame_buf at 0-based offsets. Pop exactly
+        // nwords so the FIFO stays aligned to frame boundaries; cap at the
+        // staging size and drain any overflow (jumbo frames we don't echo).
+        int nw = proc_rx.nwords;
+        int stage = (nw > FRAME_BUF_WORDS) ? FRAME_BUF_WORDS : nw;
+        for (int i = 0; i < stage; i++) { frame_buf[i] = frame_fifo.read(); }
+        for (int i = stage; i < nw; i++) { (void)frame_fifo.read(); }
+
         if (proc_rx.ethertype == ETHERTYPE_ARP) {
             arp_rx_process(reset_n, proc_rx, buffer, tx_req, NULL);
         } else if (proc_rx.ethertype == ETHERTYPE_IPV4) {
@@ -145,14 +164,15 @@ void udp_echo(
                             dhcp_rx_process(reset_n, udp_rx, buffer, dhcp_state, dhcp_xid,
                                            dhcp_offered, dhcp_server, dhcp_timer, dhcp_start);
                         } else {
-                            // Copy payload for echo — read from the buffer
-                            // region this frame landed in (BUF_A / BUF_B).
-                            int rx_pbase = udp_rx.buf_base + 7;
+                            // Copy payload for echo — read from the staged
+                            // frame buffer (word 7 = after 20B IP + 8B UDP),
+                            // write into the TX region of the shared buffer.
+                            int rx_pbase = 7;
                             int tx_pbase = TX_UDP_BASE + 7;
                             uint16_t pw = (udp_rx.payload_len + 3) >> 2;
                             for (int i = 0; i < pw; i++) {
                                 #pragma HLS PIPELINE
-                                buffer[tx_pbase + i] = buffer[rx_pbase + i];
+                                buffer[tx_pbase + i] = frame_buf[rx_pbase + i];
                             }
                             data_received = true;
                             rx_udp_len    = udp_rx.length;

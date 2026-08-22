@@ -12,6 +12,20 @@
 #include "hls_stream.h"
 
 //=============================================================================
+// RX frame channel (UG1399: never share a raw array between a concurrent
+// producer/consumer — use hls::stream). MAC RX pushes each accepted frame's
+// 32-bit payload words into a frame FIFO; udp_echo stages them into frame_buf
+// (below) at frame_done and the layers parse frame_buf at 0-based offsets.
+// The FIFO itself is a static inside udp_echo (passed to mac_rx by reference).
+//=============================================================================
+
+// Per-frame staging buffer: written-then-read within a single pass (never
+// shared across concurrent processes), so it carries no race. TX builders
+// still use the shared buffer[]. Sized for a full MTU frame (1500B = 375w).
+#define FRAME_BUF_WORDS 400
+extern uint32_t frame_buf[FRAME_BUF_WORDS];
+
+//=============================================================================
 // Protocol constants
 //=============================================================================
 
@@ -188,6 +202,7 @@ struct mac_rx_t {
     bool        is_unicast;     // dst MAC == board MAC
     bool        valid;          // frame passed MAC filter
     ap_uint<10> buf_base;       // which buffer region this frame landed in
+    ap_uint<10> nwords;         // number of 32-bit payload words pushed to frame_fifo
 };
 
 //=============================================================================

@@ -156,17 +156,16 @@ static void dhcp_rx_process(
     if (!udp_rx.valid) return;
     if (udp_rx.dst_port != DHCP_CLIENT_PORT) return;
 
-    // Read DHCP message type from options (message is in the RX buffer,
-    // right after the 20-byte IP header + 8-byte UDP header). Base comes
-    // from udp_rx.buf_base (dual-buffer BUF_A/BUF_B).
-    int rx_base = udp_rx.buf_base + 7;
+    // Read DHCP message type from options (message is in the staged frame
+    // buffer, right after the 20-byte IP header + 8-byte UDP header = word 7).
+    int rx_base = 7;
     uint8_t msg_type = 0;
-    dhcp_read_opt(buffer, rx_base, udp_rx.payload_len, 53, &msg_type);
+    dhcp_read_opt(frame_buf, rx_base, udp_rx.payload_len, 53, &msg_type);
 
     if (dhcp_state == DHCP_WAIT_OFFER && msg_type == DHCP_MSG_OFFER) {
-        offered_ip = buffer[rx_base + 4];  // yiaddr at word offset 4
+        offered_ip = frame_buf[rx_base + 4];  // yiaddr at word offset 4
         uint8_t srv[4];
-        if (dhcp_read_opt(buffer, rx_base, udp_rx.payload_len, 54, srv)) {
+        if (dhcp_read_opt(frame_buf, rx_base, udp_rx.payload_len, 54, srv)) {
             server_ip = ((uint32_t)srv[0]<<24)|((uint32_t)srv[1]<<16)|((uint32_t)srv[2]<<8)|srv[3];
         }
         dhcp_state = DHCP_REQUEST;

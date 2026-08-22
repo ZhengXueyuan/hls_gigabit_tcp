@@ -317,11 +317,11 @@ static void tcp_rx_process(bool rst, ip_rx_t &ip_rx, uint32_t *buf, mac_tx_req_t
         }
         return;
     }
-    // Parse TCP header — read from the buffer region this frame landed in
-    // (dual-buffer BUF_A / BUF_B; MAC RX alternates them per frame so a
-    // delayed frame's data is not clobbered by the next arrival).
-    int tb=ip_rx.buf_base+5;uint8_t th[20];
-    for(int i=0;i<5;i++){uint32_t w=buf[tb+i];th[i*4]=(w>>24)&0xFF;th[i*4+1]=(w>>16)&0xFF;th[i*4+2]=(w>>8)&0xFF;th[i*4+3]=w&0xFF;}
+    // Parse TCP header — read from the staged frame buffer (0-based; udp_echo
+    // popped this frame from frame_fifo into frame_buf). frame_buf[0] is the
+    // first IP word, so the TCP header starts at word 5 (20-byte IP header).
+    int tb=5;uint8_t th[20];
+    for(int i=0;i<5;i++){uint32_t w=frame_buf[tb+i];th[i*4]=(w>>24)&0xFF;th[i*4+1]=(w>>16)&0xFF;th[i*4+2]=(w>>8)&0xFF;th[i*4+3]=w&0xFF;}
     uint16_t sp=((uint16_t)th[0]<<8)|th[1],dp=((uint16_t)th[2]<<8)|th[3];
     uint32_t seq=((uint32_t)th[4]<<24)|((uint32_t)th[5]<<16)|((uint32_t)th[6]<<8)|th[7];
     uint32_t ack=((uint32_t)th[8]<<24)|((uint32_t)th[9]<<16)|((uint32_t)th[10]<<8)|th[11];
@@ -333,7 +333,7 @@ static void tcp_rx_process(bool rst, ip_rx_t &ip_rx, uint32_t *buf, mac_tx_req_t
     // for any plen up to that — a peer that ignores MSS=460 sends 536B
     // segments, which the old TCP_MSS(460)-wide buffer silently dropped.
     uint8_t payload[TCP_RX_PAYLOAD];
-    if(plen>0&&plen<=TCP_RX_PAYLOAD){int ps=tb+doff;for(int i=0;i<plen;i++){uint16_t wi=ps+(i>>2),bi=i&0x3;payload[i]=(buf[wi]>>((3-bi)*8))&0xFF;}}
+    if(plen>0&&plen<=TCP_RX_PAYLOAD){int ps=tb+doff;for(int i=0;i<plen;i++){uint16_t wi=ps+(i>>2),bi=i&0x3;payload[i]=(frame_buf[wi]>>((3-bi)*8))&0xFF;}}
     int8_t cid=tcp_find(sp,ip_rx.src_ip);
     // FIX 2026-08-18: tcp_find() returns a free slot index (>=0) when no
     // connection matches, so the old `cid<0` test was never true and every
@@ -349,14 +349,14 @@ static void tcp_rx_process(bool rst, ip_rx_t &ip_rx, uint32_t *buf, mac_tx_req_t
         // MSS/window-scale). Clamp the window scale to 0..7 (RFC 7323).
         if(doff>5){uint8_t opt_end=(doff-5)*4;for(int o=0;o+1<opt_end;){
             int obw=(tb*4+20+o)>>2;uint8_t obi=(tb*4+20+o)&3;
-            uint8_t k=(buf[obw]>>((3-obi)*8))&0xFF;if(k==0)break;if(k==1){o++;continue;}
+            uint8_t k=(frame_buf[obw]>>((3-obi)*8))&0xFF;if(k==0)break;if(k==1){o++;continue;}
             if(o+1>=opt_end)break;
             int lbw=(tb*4+20+o+1)>>2;uint8_t lbi=(tb*4+20+o+1)&3;
-            uint8_t ln=(buf[lbw]>>((3-lbi)*8))&0xFF;if(ln<2)break;
+            uint8_t ln=(frame_buf[lbw]>>((3-lbi)*8))&0xFF;if(ln<2)break;
             if(k==2&&ln>=4){int mw=(tb*4+20+o+2)>>2;uint8_t mi=(tb*4+20+o+2)&3;
-                c.peer_mss=(((uint16_t)((buf[mw]>>((3-mi)*8))&0xFF)<<8)|((buf[(tb*4+20+o+3)>>2]>>((3-((tb*4+20+o+3)&3))*8))&0xFF));}
+                c.peer_mss=(((uint16_t)((frame_buf[mw]>>((3-mi)*8))&0xFF)<<8)|((frame_buf[(tb*4+20+o+3)>>2]>>((3-((tb*4+20+o+3)&3))*8))&0xFF));}
             else if(k==3&&ln>=3){int ww=(tb*4+20+o+2)>>2;uint8_t wi=(tb*4+20+o+2)&3;
-                uint8_t ws=(buf[ww]>>((3-wi)*8))&0xFF;c.peer_wscale=(ws<=7)?ws:0;}
+                uint8_t ws=(frame_buf[ww]>>((3-wi)*8))&0xFF;c.peer_wscale=(ws<=7)?ws:0;}
             o+=ln;
         }}
         // Adjust cwnd to peer's MSS if smaller

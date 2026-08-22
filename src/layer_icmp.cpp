@@ -54,13 +54,13 @@ static void icmp_rx_process(
     if (!ip_rx.valid) return;
     if (ip_rx.protocol != IP_PROTO_ICMP) return;
 
-    // ICMP header starts after 20-byte IP header (5 words from buf_base)
-    int icmp_base = ip_rx.buf_base + 5;
+    // ICMP header starts after 20-byte IP header (word 5 of the staged frame)
+    int icmp_base = 5;
 
     // Read first 8 bytes of ICMP header
     uint8_t icmp_hdr[8];
     for (int i = 0; i < 2; i++) {
-        uint32_t w = buffer[icmp_base + i];
+        uint32_t w = frame_buf[icmp_base + i];
         icmp_hdr[i*4 + 0] = (w >> 24) & 0xFF;
         icmp_hdr[i*4 + 1] = (w >> 16) & 0xFF;
         icmp_hdr[i*4 + 2] = (w >> 8)  & 0xFF;
@@ -84,11 +84,11 @@ static void icmp_rx_process(
         int icmp_words = (icmp_total_len + 3) >> 2;  // round up to words
 
         for (int i = 0; i < icmp_words; i++) {
-            buffer[tx_base + i] = buffer[icmp_base + i];
+            buffer[tx_base + i] = frame_buf[icmp_base + i];
         }
 
         // Modify type: 8 → 0 (in place, word 0 of ICMP header)
-        uint32_t w0 = buffer[icmp_base];
+        uint32_t w0 = frame_buf[icmp_base];
         w0 = (w0 & 0x00FFFFFF) | (ICMP_ECHO_REPLY << 24);  // byte 0 = new type
         buffer[tx_base] = w0;
 

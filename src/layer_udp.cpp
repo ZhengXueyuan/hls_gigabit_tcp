@@ -32,12 +32,12 @@ static void udp_rx_process(
     if (!ip_rx.valid) return;
     if (ip_rx.protocol != IP_PROTO_UDP) return;
 
-    // UDP header starts after 20-byte IP header (5 words from this frame's buf_base)
-    int udp_base = ip_rx.buf_base + 5;
+    // UDP header starts after 20-byte IP header (word 5 of the staged frame)
+    int udp_base = 5;
 
     uint8_t udp_hdr[8];
     for (int i = 0; i < 2; i++) {
-        uint32_t w = buffer[udp_base + i];
+        uint32_t w = frame_buf[udp_base + i];
         udp_hdr[i*4 + 0] = (w >> 24) & 0xFF;
         udp_hdr[i*4 + 1] = (w >> 16) & 0xFF;
         udp_hdr[i*4 + 2] = (w >> 8)  & 0xFF;

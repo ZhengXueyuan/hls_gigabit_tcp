@@ -162,9 +162,8 @@ static void arp_rx_process(
     if (!mac_rx.valid || mac_rx.ethertype != ETHERTYPE_ARP) return;
 
     uint8_t arp_bytes[28];
-    ap_uint<10> base = mac_rx.buf_base;
     for (int i = 0; i < 7; i++) {
-        uint32_t w = buffer[base + i];
+        uint32_t w = frame_buf[i];   // staged frame (0-based); ARP body = 7 words
         arp_bytes[i*4]=(w>>24)&0xFF;arp_bytes[i*4+1]=(w>>16)&0xFF;
         arp_bytes[i*4+2]=(w>>8)&0xFF;arp_bytes[i*4+3]=w&0xFF;
     }
