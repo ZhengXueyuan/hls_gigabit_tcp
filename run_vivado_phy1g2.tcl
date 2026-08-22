@@ -8,8 +8,9 @@ import_files -norecurse wrapper_1g.v net_stats.v util_gmii_to_rgmii.v
 set src_dir [file dirname [lindex [glob vivado_prj/udp_dual_phy1g2.srcs/sources_1/imports/verilog/*.v] 0]]
 foreach dat [glob -nocomplain udp_echo_prj/solution1/syn/verilog/*.dat] { file copy -force $dat $src_dir/ }
 foreach dat [glob -nocomplain uart_hls/uart_prj/solution1/syn/verilog/*.dat] { file copy -force $dat $src_dir/ }
-set bram [glob -nocomplain vivado_prj/udp_dual_phy1g2.srcs/sources_1/imports/verilog/udp_echo_buffer_r_RAM_2P_BRAM_1R1W.v]
-if {[llength $bram] > 0} { file copy -force buffer_bram_fix.v [lindex $bram 0] }
+# BRAM fix disabled for dual-buffer testing
+# set bram [glob -nocomplain vivado_prj/udp_dual_phy1g2.srcs/sources_1/imports/verilog/udp_echo_buffer_r_RAM_2P_BRAM_1R1W.v]
+# if {[llength $bram] > 0} { file copy -force buffer_bram_fix.v [lindex $bram 0] }
 add_files -fileset constrs_1 xdc/eco_rgmii_phy1.xdc
 set_property top $top_module [current_fileset]
 update_compile_order -fileset sources_1

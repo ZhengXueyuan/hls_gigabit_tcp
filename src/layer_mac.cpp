@@ -35,6 +35,7 @@ static void mac_rx_process(
     static uint32_t wr_word      = 0;
     static uint8_t  wr_byte      = 0;
     static uint8_t  vlan_hdr_rem = 0;    // remaining VLAN tag bytes to skip
+    static bool     rx_buf_sel   = false; // dual-buffer: false=BUF_A, true=BUF_B
 
     rx.valid        = false;
     rx.ethertype    = 0;
@@ -42,6 +43,7 @@ static void mac_rx_process(
     rx.dst_mac      = 0;
     rx.is_broadcast = false;
     rx.is_unicast   = false;
+    rx.buf_base     = 0;
 
     if (!reset_n) {
         state         = MAC_RX_IDLE;
@@ -56,6 +58,7 @@ static void mac_rx_process(
         wr_word       = 0;
         wr_byte       = 0;
         vlan_hdr_rem  = 0;
+        rx_buf_sel    = false;
         return;
     }
 
@@ -72,7 +75,7 @@ static void mac_rx_process(
             dst_mac_acc  = 0;
             src_mac_acc  = 0;
             eth_acc      = 0;
-            buf_wr_addr  = RX_BUFFER_BASE;
+            buf_wr_addr  = rx_buf_sel ? BUF_B_BASE : BUF_A_BASE;
             wr_word      = 0;
             wr_byte      = 0;
             vlan_hdr_rem = 0;
@@ -151,6 +154,8 @@ static void mac_rx_process(
                 rx.dst_mac   = saved_dst_mac;
                 rx.src_mac   = saved_src_mac;
                 rx.valid     = true;
+                rx.buf_base  = rx_buf_sel ? BUF_B_BASE : BUF_A_BASE;
+                rx_buf_sel   = !rx_buf_sel;
                 state = MAC_RX_IDLE;
             }
             break;

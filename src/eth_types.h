@@ -125,11 +125,16 @@ struct gmii_byte_t {
 //=============================================================================
 // Buffer partitioning
 //=============================================================================
+// Dual-buffer for MAC RX: alternating frames land in BUF_A / BUF_B so that
+// MAC RX writing and layer processing never touch the same region.
 #define BUFFER_DEPTH        512
+#define BUF_A_BASE          0
+#define BUF_B_BASE          160
+#define BUF_SIZE            160   // 640B — fits max TCP segment (536B + headers)
 #define RX_BUFFER_BASE      0
-#define RX_BUFFER_SIZE      256   // UDP RX payload area
-#define TX_SCRATCH_BASE     256   // ARP/ICMP TX frame scratch area
-#define TX_SCRATCH_SIZE     128
+#define RX_BUFFER_SIZE      BUF_SIZE
+#define TX_SCRATCH_BASE     256   // ARP/ICMP/IGMP TX frame scratch area
+#define TX_SCRATCH_SIZE     64    // 256..319
 // FIX 2026-08-19: TX_UDP_BASE moved down from 384 so a single 536B TCP segment
 // (Windows ignores the MSS=460 advert) fits in ONE TX frame: 20 IP + 20 TCP +
 // 536 payload = 576B = 144 words. Region 320..512 = 192 words = 768B (48-word
@@ -172,6 +177,7 @@ struct mac_rx_t {
     bool        is_broadcast;   // dst MAC == FF:FF:FF:FF:FF:FF
     bool        is_unicast;     // dst MAC == board MAC
     bool        valid;          // frame passed MAC filter
+    ap_uint<9>  buf_base;       // which buffer region this frame landed in
 };
 
 //=============================================================================
@@ -200,6 +206,7 @@ struct ip_rx_t {
     ap_uint<16> id;             // IP identification
     bool        checksum_ok;
     bool        valid;
+    ap_uint<9>  buf_base;       // buffer region for this IP packet
 };
 
 //=============================================================================
@@ -250,6 +257,7 @@ struct udp_rx_t {
     ap_uint<16> checksum;
     ap_uint<16> payload_len;    // actual payload bytes
     bool        valid;
+    ap_uint<9>  buf_base;       // buffer region for this UDP datagram
 };
 
 #endif // ETH_TYPES_H
