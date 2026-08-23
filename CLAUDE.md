@@ -5,6 +5,20 @@ perfv `udp_hls` HLS 网络协议栈移植到 ECO 板 (XC7K325T-2FFG676C) 的副�
 (**每次实验先追加记录再动手**); 全局 HLS 铁律在用户 CLAUDE.md (ap_ctrl_none body II=1 /
 异步引脚同步器写在 wrapper / csim≠板级 等)。
 
+## 下一阶段: 10G 纯硬件 TCP/IP 重构 (设计审查已完成, 待开工)
+
+终局目标 = 10G 线速纯硬件 TCP/IP (低延时行情 UDP 组播 + 交易 TCP 少量连接), 对上提供 TCP/UDP
+接口。设计审查 + 头脑风暴产物在 **`design_review/`** (总纲 `04_construction_plan.md`, 附
+01 现状分析 / 02 行业调研 / 03 候选架构)。结论要点:
+- 现状单 FSM 排空 ~1B/30拍 (~33Mbps), 距 10G 差 ~200×; 根因 = ap_ctrl_none 串行 body + 1字节粒度
+  + RX/TX 互斥 — 必须推倒重写; 协议语义资产 (已板级验证) 全部可移植。
+- **主推架构 B**: 纯 RTL 64bit 数据面流水 (PG157 10G MAC/BASE-R + 解析/CSA 校验和/5-tuple 分流/
+  TCB/组播旁路) + 慢路径原样移植现有 HLS 层 (握手/重传/RTO/ARP/ICMP/DHCP), 快慢经 AXIS CDC FIFO
+  + BRAM mailbox 解耦; 资源 ~30-45K LUT (<15%), 合 ~40-60 人天 (P0-P5)。
+- **前置阻塞决策**: 板载 GT 参考钟仅 125MHz, 出不来 10.3125Gbps — 需换 156.25MHz 晶振
+  (SIT9120AI-2B3-33E156.25, 原理图官方建议), 否则降级 1G+新架构 (收益保留)。待用户拍板。
+- 本 1G 工程冻结为回归基线 (py_net_test 7/7 PASS 参照), 10G 开发在独立目录 (建议 `udp_hls_10g/`)。
+
 ## 当前状态 (2026-08-23, 最终)
 
 - ✅ **全链打通并通过压测**: `py_net_test.py` (anaconda python `/c/Users/zhxue/anaconda3/python.exe`)
