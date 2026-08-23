@@ -37,7 +37,7 @@
 // LEDs D2=IDELAYCTRL RDY, D3=MMCM ref locked.
 //=============================================================================
 
-module wrapper_1g (
+module wrapper_1g_ila (
     input           reset_n,        // async reset, active low (KEY1)
     input           fpga_gclk,      // 50MHz board oscillator (UART + MMCM ref)
     // RGMII RX from PHY (RTL8211E)
@@ -273,11 +273,13 @@ module wrapper_1g (
     // The HLS IP's rx_stream_TREADY is only high when its outer FSM is in
     // the RX state — passing wire bytes straight through would overwrite
     // its 1-deep input regslice and drop most of every frame.
-    // FIX 2026-08-23: 2048->4096 (threshold 1900->3900). The HLS DUT drains
-    // slowly (~1 byte/20 cyc), so a back-to-back burst accumulates in the FIFO.
-    // 3 segments (~1794B) fit; a 4th segment (2000B total, ~2392B) overflowed
-    // the 1900 gate, dropping mid-frame bytes + the last flag -> corrupted the
-    // 4th TCP echo segment. Board ILA confirmed rx_occ hit 1900 during seg4.
+    // FIX 2026-08-23 (ILA-proven): 2048→4096. The DUT drains at ~1 byte/20cy
+    // (pass-structured FSM), so a 4-segment back-to-back TCP burst (4×602B)
+    // filled the 2048 FIFO past the occ<1900 gate mid-segment-4 → the gate
+    // dropped ~275B of seg4's middle and subsampled its tail at stride ~21
+    // (the "乱序" signature). 4096 covers the 4-seg burst (peak occ ~2400);
+    // gate 3900. NOTE: bursts >6 segments still overflow — the real fix is a
+    // wire-rate-capable DUT drain, which is HLS-side.
     reg [8:0] rx_fifo [0:4095];     // {last, data}
     reg [11:0] rx_wptr, rx_rptr;
     wire [11:0] rx_occ = rx_wptr - rx_rptr;
@@ -369,6 +371,11 @@ module wrapper_1g (
     end
 
     // Network IP instance
+    wire [10:0] dbg_tsb_addr0, dbg_tsb_addr1;
+    wire [7:0]  dbg_tsb_d1, dbg_tsb_q0;
+    wire [15:0] dbg_q_len, dbg_q_off;
+    wire [32:0] dbg_fsm;
+    wire [15:0] dbg_ctrl;
     udp_echo u_net (
         .ap_clk             (gmii_clk),
         .ap_rst_n           (ip_enable & reset_n),
@@ -385,7 +392,15 @@ module wrapper_1g (
         .led_d0             (led_d0_hls),
         .led_d1             (led_d1_hls),
         .led_d2             (led_d2_hls),
-        .led_d3             (led_d3_hls)
+        .led_d3             (led_d3_hls),
+        .dbg_tsb_addr0      (dbg_tsb_addr0),
+        .dbg_tsb_addr1      (dbg_tsb_addr1),
+        .dbg_tsb_d1         (dbg_tsb_d1),
+        .dbg_tsb_q0         (dbg_tsb_q0),
+        .dbg_q_len          (dbg_q_len),
+        .dbg_q_off          (dbg_q_off),
+        .dbg_fsm            (dbg_fsm),
+        .dbg_ctrl           (dbg_ctrl)
     );
 
     // --- msg stream: DISABLED (cross-clock-domain issue) ---
@@ -527,6 +542,55 @@ module wrapper_1g (
                       raw_cap[11], raw_cap[10], raw_cap[9],  raw_cap[8],
                       raw_cap[7],  raw_cap[6],  raw_cap[5],  raw_cap[4],
                       raw_cap[3],  raw_cap[2],  raw_cap[1],  raw_cap[0]})
+    );
+
+    //=========================================================================
+    // ILA debug: frame counters (idle-auto-reset for deterministic triggers)
+    // + ila_0 probing the TCP echo queue race (tcp_send_bufs / q pointers / FSM)
+    //=========================================================================
+    wire rx_beat      = net_rx_valid && net_rx_ready;
+    wire rx_last_beat = rx_beat && net_rx_data[8];
+    wire tx_beat      = net_tx_valid && net_tx_ready;
+    wire tx_last_beat = tx_beat && net_tx_data[8];
+    reg [7:0]  dbg_rx_fcnt, dbg_tx_fcnt;
+    reg [23:0] rx_idle_cnt;
+    always @(posedge gmii_clk or negedge reset_n) begin
+        if (!reset_n) begin
+            dbg_rx_fcnt <= 8'd0; dbg_tx_fcnt <= 8'd0; rx_idle_cnt <= 24'd0;
+        end else begin
+            if (rx_beat) rx_idle_cnt <= 24'd0;
+            else if (rx_idle_cnt < 24'd625000) rx_idle_cnt <= rx_idle_cnt + 24'd1;
+            else begin
+                // >5ms of no DUT RX activity: re-zero both counters so every
+                // host test run restarts frame numbering at the same values.
+                dbg_rx_fcnt <= 8'd0;
+                dbg_tx_fcnt <= 8'd0;
+            end
+            if (rx_last_beat) dbg_rx_fcnt <= dbg_rx_fcnt + 8'd1;
+            if (tx_last_beat) dbg_tx_fcnt <= dbg_tx_fcnt + 8'd1;
+        end
+    end
+
+    // wire-side GMII truth + stream handshakes + RX FIFO occupancy (probe12/13)
+    wire [7:0] dbg_wire = {e_rxdv, e_txen, net_rx_valid, net_rx_ready,
+                           net_tx_valid, net_tx_ready, 2'b00};
+
+    ila_0 u_ila (
+        .clk    (gmii_clk),
+        .probe0 (dbg_tsb_addr1),          // tcp_send_bufs write addr (tcp_queue)
+        .probe1 (dbg_tsb_addr0),          // tcp_send_bufs read addr (tcp_send_1)
+        .probe2 (dbg_tsb_d1),             // write data
+        .probe3 (dbg_tsb_q0),             // read data
+        .probe4 (dbg_q_len),              // queue length register
+        .probe5 (dbg_q_off),              // queue read offset register
+        .probe6 (dbg_fsm),                // ap_CS_fsm[32:0] one-hot
+        .probe7 (dbg_ctrl),               // ce0/ce1/we1/tx_req/busy/start/done...
+        .probe8 (net_rx_data[8:0]),       // DUT rx stream {last,data}
+        .probe9 (net_tx_data[8:0]),       // DUT tx stream {last,data}
+        .probe10(dbg_rx_fcnt),
+        .probe11(dbg_tx_fcnt),
+        .probe12(dbg_wire),               // wire dv/en + stream valid/ready
+        .probe13(rx_occ)                  // wrapper RX FIFO occupancy
     );
 
 endmodule

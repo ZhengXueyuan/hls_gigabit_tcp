@@ -1351,3 +1351,164 @@ cosim_design 报错: "Cosim only supports ap_ctrl_none designs that are (1) comb
   (读) 并发操作同一 tcp_send_bufs[cid] 数组 (同类反模式, 在TX侧, 重构未触及)。
   第4段才出错 = 此时队列正被边读边写。
 - 教训: 连续多架构同点失败时, 应早怀疑假设本身, 而不是继续在同方向加架构。
+
+---
+
+## 2026-08-23 — xsim RTL TB 调查 (方案A): DUT 能驱动, 但 FSM 卡 state22(dhcp)
+
+### 搭建了 xsim RTL 测试台 (tb_udp_echo.v)
+- Python 生成刺激 stim.memh (SYN+ACK+536*3+392+收尾ACK, 板级 2000B 分段), 
+  Verilog TB 按 axis 协议 (negedge 采样 rx_ready) 喂 DUT, 捕获 tx_stream 到 resp.memh。
+- 踩坑: ① xvlog 单独编译 TB 进 work 库, 但 xelab 用 xil_defaultlib → 必须 
+  `xvlog -work xil_defaultlib`; ② .bat 重定向 `> xvlog.log` 与工具自身日志冲突; 
+  ③ TB 握手在 posedge 后读 rx_ready 误报 STALL (字节其实已消费)。
+
+### 结果: DUT 接收了 2 字节后 FSM 卡死
+- 波形探针 (hierarchical 引用 dut.ap_CS_fsm / grp_mac_rx_*): 
+  复位后 FSM 遍历 state, macrx_start 只脉冲一次, 之后恒 **cs=0x200000 = state22**, 
+  macrx_idle=1, ff_wr=0, tx_v=0 — **卡在 state22 等 grp_dhcp_tx_process 的 ap_done**。
+- 但**板上 dhcp 完全正常** (ping/UDP/1608B 全过) → 这是 **xsim 环境与板子的差异**
+  (msg_stream 消费/驱动方式), 不是 DUT 坏, 也不是 2000B 竞态 (这是第一帧就卡)。
+- 结论: 此 xsim 卡死与目标的第4段竞态**是两个不同问题**。要复现 2000B 需先解开
+  dhcp 卡死 (环境向), 投入大且偏离目标。
+
+---
+
+## ILA 调试 — 2000B 第4段竞态板级定位 (2026-08-23)
+
+### 假设 (TL 修正后)
+三种 RX 架构 (双缓冲/去FIFO/stream) 都在第4段同一相对位置 FAIL → 病根不在 RX 缓冲。
+修正假设: **TX 队列 tcp_send_bufs 竞态** — tcp_queue (写, tcp_rx_process/state19) 与
+tcp_maintenance→tcp_send (读, tcp_send_1/state28) 并发/乱序访问 tcp_send_bufs[cid]。
+第4段才出错 = 此时队列正被边读边写 (MAC busy 导致队列积压)。
+
+### 关键静态事实 (快照 b6282ac 网表)
+- `tcp_send_bufs_U` = 1728B BRAM = [3 conn][576]; 地址 = cid*576 + 偏移。
+  Port0(读): addr=grp_tcp_send_1.payload_address0, ce0 仅在 state28 使能, q0→tcp_send_1.payload_q0。
+  Port1(写): addr1/ce1/we1/d1 来自 grp_tcp_rx_process, 仅在 state19 使能。
+- 顶层 FSM 33 态 one-hot: state19 与 state28 互斥 → 同拍同址撞车结构上不可能;
+  竞态若是, 必为**跨拍乱序** (读早于人写/写覆盖未读) 或 **队列指针值错误**。
+- 队列指针是顶层寄存器 (好探): `tcp_q_len[15:0]`/`tcp_q_off[15:0]`/`tcp_q_cid[2:0]`,
+  由 grp_tcp_rx_process 与 grp_tcp_send_1 的 *_o(+ap_vld) 输出写回。
+- tcp_queue: `if(q_len==q_off){q_len=0;q_off=0}`; room=576-q_len; 写 [cid][q_len+i]。
+  tcp_maintenance: 每 pass 至多 1 chunk(≤536); `tcp_send(...send_bufs[q_cid]+q_off, chunk)`;
+  q_off+=chunk; q_off>=q_len → 双清零。top 层仅当 `!tx_req.request && !mac_tx_busy` 才调。
+
+### ILA 方案 (避开 3 个历史坑)
+- **IP 实例化路线**: tcl `create_ip ila` 生成 ila_0 (不走 generate_debug_cores, 不走 XDC 手写通道,
+  不直接探 BRAM 内容只探端口), wrapper 里显式例化, clk=gmii_clk, 深度 16384。
+- DUT 内部信号: **不改逻辑**, 给 udp_echo 加 8 个 dbg_* 输出端口 (纯 assign),
+  引出 tcp_send_bufs 双端口 + q_len/q_off/q_cid + ap_CS_fsm + 控制位。
+  改的是快照副本 `ila_dbg_src/udp_echo.v` (快照原目录不动)。
+- wrapper_1g_ila.v: 复制 wrapper_1g.v, 加 ila_0 + rx/tx 帧计数器 (>5ms 空闲自动清零,
+  使每次测试触发值确定)。
+- 工程: `vivado_ila_prj/`, 顶层 wrapper_1g_ila, 源=ila_rtl_snapshot(除 udp_echo.v)
+  + ila_dbg_src/udp_echo.v + wrapper_1g_ila.v + net_stats.v + util_gmii_to_rgmii.v。
+
+### 探针清单 (ila_0, 12 probes, 16384 深 ≈131us @125MHz)
+probe0[10:0]=tsb写址 probe1[10:0]=tsb读址 probe2[7:0]=tsb写数据 probe3[7:0]=tsb读数据
+probe4[15:0]=tcp_q_len probe5[15:0]=tcp_q_off probe6[32:0]=ap_CS_fsm
+probe7[15:0]=ctrl{ce0,ce1,we1,tx_req.mac,busy,rxstart,rxdone,sendstart,senddone,macstart,macdone,ff_wr,ff_fulln,q_cid[2:0]}
+probe8[8:0]=rx_stream{last,data} probe9[8:0]=tx_stream{last,data}
+probe10[7:0]=rx帧计数 probe11[7:0]=tx帧计数
+
+### 触发计划
+1. 捕获A: 触发 probe4(tcp_q_len)!=0 @位置512 → 抓整段数据突发, 学帧编号/时序。
+2. 捕获B: 触发 probe10(rx帧计数)==第4数据段帧号 @位置4096 → 聚焦第4段入队+回显。
+3. 分析: 对照 q_len/q_off 与 tsb 写/读地址序列, 找读早于写/写覆盖未读/指针错位的确切拍点。
+
+---
+
+## 2026-08-23 xsim RTL 仿真侧修复 (TCP echo 纯逻辑验证)
+
+### 任务
+让 udp_echo DUT 在 xsim 里跑完 2000B 突发 (536*3+392), 看能否复现板上第4段乱序竞态。
+
+### 卡死根因 (3 个, 全是 TB/仿真侧)
+1. **DUT `reset_n` 端口 TB 漏接** — udp_echo 顶层除 `ap_rst_n` 外还有一个 HLS 软复位输入
+   `reset_n` (C++ 层 ap_none 标量)。TB 实例化时没接 → 悬空 = Z → `reset_n==1'd1` 比较得 X →
+   dhcp_tx_process 等所有子模块的 `ap_phi_mux_*_phi_fu_*_p4` 走 `'bx` 分支 → 全部子 FSM
+   死锁在 state1。顶层 ap_CS_fsm 卡 state22 (dhcp_tx 调用点)。
+   **修复**: TB 实例化加 `.reset_n(rst_n)`。
+   **教训**: HLS ap_ctrl_none 设计的所有 ap_none 标量输入在 TB 里必须显式接, 不能悬空。
+2. **TB `break` 语法** — xsim xelab 只支持 Verilog-2001, `break` 是 SystemVerilog。
+   改成 `begin:wait_rdy reg accepted; ...` 标志位。
+3. **TB 在 posedge 用 blocking assign 更新 rx_data 与 regslice 采样竞争** —
+   原 feed: `@(posedge clk); accepted=1; rx_valid=0; idx++; rx_data=stim[idx];` 同一 posedge
+   里 TB 改 rx_data 和 regslice 采样 rx_data 顺序不定 → regslice 采到**下一字节**,
+   静默丢当前字节 (实测丢第7个 0x55 → mac_rx preamble 状态机卡死: byte_cnt_1=6 时
+   收 0xD5, and_ln86=0 且 and_ln87=0, state_1 永不到 4, ff_wr 全程=0)。
+   **修复**: feed 改成 **negedge 驱动** (`@(negedge clk); rx_data=...; rx_valid=1;`
+   等 ready, posedge 传输, 下一 negedge 清 valid)。posedge 时 rx_data 稳定。
+4. **DHCP 首次启动需 dhcp_delay > 1e8 周期 (~0.8s 仿真时间)** — xsim 20ms timeout 等不到,
+   DUT 永远 INIT, TCP echo 需要 BOUND (dhcp_state==5)。
+   **修复**: TB 里 `force dut.dhcp_state = 3'd5; force dut.dhcp_reported = 1'b1;` 跳过 DHCP
+   (等价于板上"DHCP 已完成"的稳态)。这是 TB 侧合法干预, 不改被测逻辑。
+
+### 结果
+- xsim 跑完 2434 字节 stimulus, `tx_count=2338`, resp.memh 5 帧:
+  SYN-ACK (flags=0x12) + 4 段数据回显 (536+536+536+392 = 2000B)。
+- **2000B echo payload 逐字节匹配期望 (i&0xFF), 无错位** (parse_resp.py, 注意
+  DUT tx_stream 尾部附带 4B FCS, 需按 IP tot_len 截 payload, 否则 FCS 被误算成错位)。
+- **板上第4段乱序在 xsim 里不复现** → 该 bug 依赖物理时序 (PHY 125MHz 连续喂入速率
+  vs TB 的 ready-握手均匀喂入 ~21cyc/byte), 是**真实竞态**, 纯逻辑仿真不可见。
+  下一步定位必须用板级 ILA (见上文 ILA 方案), 或在 TB 里模拟 PHY 速率连续喂入
+  (无视 ready 硬灌) 制造竞争条件。
+
+### 文件
+- `tb_udp_echo.v`: 修 reset_n/break/negedge-feed/DHCP-force, 加 regslice/mac_rx/dhcp 探针
+- `parse_resp.py`: 新增, 解析 resp.memh 重组 TCP echo, 逐字节校验
+- xsim 复跑: `cmd //c "cd /d D:\repo\ECO\udp_hls_eco\xsim_run && set PATH=C:\AMDDesignTools\2025.2\Vivado\bin;%PATH% && xvlog -work xil_defaultlib ..\tb_udp_echo.v > _xv.txt 2>&1 && xelab xil_defaultlib.tb_udp_echo -s tb_snap -debug all > _xe.txt 2>&1 && xsim tb_snap -runall > _xsim_out.txt 2>&1"`
+
+## ★ TL 转折 (2026-08-23): DUT 逻辑无错, 头号嫌疑 = wrapper rx_fifo 溢出
+
+Agent A (xsim) 修复 TB 漏接 reset_n 后, **2000B 在 xsim 逐字节全对** → DUT 逻辑正确。
+板上第4段错位不复现于 xsim 理想馈入 → bug 在 DUT 之外的物理时序路径。
+
+**新头号嫌疑: wrapper rx_fifo 桥溢出丢字节**:
+- rx_fifo 仅 2048 深, `rx_push = rx_dv_d2 && (rx_occ < 1900)` — 满 1900 即丢字节
+- 2000B = 4 段背靠背 ≈ 2392B > 2048
+- DUT 处理/回显前段时离开 RX 态暂停消费 → FIFO 在第4段到达时填满 → 丢字节 → 帧错位
+- 解释: 单段/小流量全过, 仅第4段挂; xsim (直接喂 DUT, 无 FIFO) 不复现
+
+**ILA agent 请优先探**: rx_occ/rx_wptr/rx_rptr/rx_push/rx_pop + net_rx_data,
+看 2000B 突发时 rx_occ 是否顶到 1900 丢字节。另可考虑: 加大 FIFO 到 4096 或提高阈值。
+
+### ILA 捕获结果 (2026-08-23, 3 次捕获实锤)
+
+**根因破案: 不是 tcp_send_bufs 竞态, 是 wrapper RX FIFO 溢出。**
+
+| 捕获 | 触发 | 关键证据 |
+|------|------|---------|
+| A (cap_a.csv) | tcp_q_len!=0 | 段1/段2 全程干净: DUT rx_stream 无拼接, 队列写/读地址数据全对 |
+| B (cap_b.csv) | rx_fcnt==3 (第4段) | DUT 收到的 seg4 只有 277 拍(应 458), payload 在偏移131处拼接, 内容是 **下一帧的前导码55×8+d5+PC MAC/IP头** 直接融合; 尾部 stride-21 乱序字节。tcp_send_bufs 队列写数据本身已带 splice@131 → 损坏在队列写上游 |
+| C (cap_c.csv) | rx_occ>399 | **4段 rxdv 全连续完整 (602/602/602/458cy, 无跌落)**; occ: 569→1142→1714(seg3后)→**seg4 期间撞 1900 门限**, smp3612 起 1899↔1900 以 ~21cy 振荡到 ~3867 |
+
+**机制**: DUT 排空速率 ~1字节/20周期 (pass 结构慢), 远低于线速。3段背靠背 FIFO 攒到
+1714 (<1900 侥幸), 第4段 (458B) 到达时 occ 撞 `rx_occ<1900` 门限关闭 → seg4 中段
+~275B 被丢; 门限振荡期每21线网字节只存1个 (**stride-21 子采样** = "乱序"垃圾的特征,
+与 PC 端 FAIL 字节的 stride-21 模式吻合); seg4 的 last 标志也被丢 → 下一帧融合进来。
+DUT 不校验 RX 的 TCP checksum (tcp_csum 只用于建包) → 拼接帧被照收照回显。
+
+**为何之前三种 RX 重构都失败**: 改的都是 DUT 内部缓冲 (双缓冲/去FIFO/stream),
+wrapper 层 2048 FIFO 桥和排空速率从未动 → 同一相对位置复发。错误位置随综合漂移 =
+DUT 排空速率随 HLS 时序变化 → 门限关闭点移动。
+
+**为何 1608B PASS / 2000B FAIL**: 3段峰值 occ=1714<1900, 4段需求 ~2400>1900。
+临界 1726-1739 = 3×536+118~131 = 门限关闭点。
+
+### 修复验证计划 (wrapper 侧, 不碰 src/HLS)
+wrapper_1g_ila.v 的 rx_fifo: 2048→4096, 指针 11→12bit, 门限 1900→3900, 重建烧录跑
+2000B。若 PASS → 根因坐实。注意: 这只治标 — 8段(4096B=4816B)仍会爆; 治本是让 DUT
+排空跟上线速 (mac_rx 每 pass 都武装 / 减小 pass 周期), 属 HLS 侧 (并行 agent 领域)。
+
+### 修复验证 (2026-08-23, wrapper_1g_ila 4096 FIFO)
+- rx_fifo 2048→4096, 指针 12bit, 门限 3900。重建烧录后:
+  - **py_net_test 7/7 全 PASS** (UDP64/512, TCP25/1608, TCP2000×3)
+  - 标度预测验证: 2500B(5段) PASS, 3000B(6段) PASS, **4096B(8段) FAIL@3642**
+    (= 4096 FIFO/3900 门限在第7段被打爆的预测点) — 标度行为与根因完全吻合
+  - 修复位流的 ILA 确认: 2000B 突发 occ 峰值 **2153** (>旧门限1900, 旧设计在此丢253B),
+    新门限3900 内无恙 → PASS
+- **结论**: 2000B 第4段竞态 = wrapper RX FIFO 溢出 (wire 线速 vs DUT ~1/20 排空),
+  与 tcp_send_bufs / RX 重构 / BRAM written 阵列全部无关。4096 FIFO 治标 (≤6段);
+  治本需 HLS 侧让 mac_rx 排空跟上线速 (或继续加大 FIFO 覆盖目标突发长度)。

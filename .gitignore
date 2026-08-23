@@ -56,3 +56,12 @@ tmp_*
 
 # UART test artifacts
 uart_hls/uart_prj/
+
+# ILA / xsim debug artifacts (large, regenerable)
+cap_*.csv
+stim.memh
+resp.memh
+xsim_run/
+ila_rtl_snapshot/
+vivado_ila_prj/
+*.hls.failed
