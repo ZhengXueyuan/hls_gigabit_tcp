@@ -15,9 +15,10 @@ perfv `udp_hls` HLS 网络协议栈移植到 ECO 板 (XC7K325T-2FFG676C) 的副�
 - **主推架构 B**: 纯 RTL 64bit 数据面流水 (PG157 10G MAC/BASE-R + 解析/CSA 校验和/5-tuple 分流/
   TCB/组播旁路) + 慢路径原样移植现有 HLS 层 (握手/重传/RTO/ARP/ICMP/DHCP), 快慢经 AXIS CDC FIFO
   + BRAM mailbox 解耦; 资源 ~30-45K LUT (<15%), 合 ~40-60 人天 (P0-P5)。
-- **前置阻塞决策**: 板载 GT 参考钟仅 125MHz, 出不来 10.3125Gbps — 需换 156.25MHz 晶振
-  (SIT9120AI-2B3-33E156.25, 原理图官方建议), 否则降级 1G+新架构 (收益保留)。待用户拍板。
-- 本 1G 工程冻结为回归基线 (py_net_test 7/7 PASS 参照), 10G 开发在独立目录 (建议 `udp_hls_10g/`)。
+- **施工已启动 (2026-08-23, 用户拍板: 1G 先行 / 10G-ready)**: 新工程 `D:\repo\ECO\udp_hls_10g`
+  (独立 git); 数据面 64bit 字流 @125MHz, P0 = MAC RX 骨架 (mac_rx_64 + xsim 逐字节验证);
+  晶振/10G 物理层后置为可选 P6 (换 SIT9120AI-2B3-33E156.25 + PG157 原位升级, 流水线不改)。
+- 本 1G 工程冻结为回归基线 (py_net_test 7/7 PASS 参照)。
 
 ## 当前状态 (2026-08-23, 最终)
 
