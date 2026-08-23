@@ -3,8 +3,8 @@
 ```mermaid
 graph TB
     subgraph PC["PC (192.168.100.1)"]
-        APP["PowerShell TCP/UDP Client"]
-        NIC["Killer E5000B NIC<br/>comp 102"]
+        APP["PowerShell TCP/UDP Client<br/>py_net_test.py (7/7 PASS)"]
+        NIC["Killer E5000B NIC<br/>comp 117"]
         PKTMON["pktmon 抓包"]
     end
 
@@ -28,7 +28,7 @@ graph TB
         end
 
         subgraph BRIDGES["AXI-Stream 帧缓冲桥"]
-            RX_FIFO["RX FIFO 2048×9<br/>{last, data[7:0]}"]
+            RX_FIFO["RX FIFO 4096×9 (阈值3900)<br/>{last, data[7:0]}<br/>2026-08-23 由2048/1900加深"]
             TX_FIFO["TX FIFO 2048×9<br/>整帧缓冲, ≥12周期IFG"]
             RX_CTL["rx_push: rx_dv_d2 门控<br/>rx_last = rx_dv_d2 && !rx_dv_d1"]
             TX_CTL["tx_draining 状态机<br/>TLAST=TDATA[8]"]
@@ -51,10 +51,11 @@ graph TB
     subgraph HLS_IPS["HLS IP 核"]
         subgraph IP1["IP1: udp_echo @125MHz gmii_clk"]
             direction TB
-            BUF["buffer[512] BRAM<br/>RX[0..255] TX_SCRATCH[256..319] TX_UDP[320..511]"]
-            
+            FIFOBUF["frame_fifo (hls::stream, 512深)<br/>+ frame_buf[400] 帧暂存<br/>(RX 流式, UG1399 模式)"]
+            BUF["buffer[768] BRAM (TX 专用)<br/>TX_SCRATCH[320..383]<br/>DHCP[384..511] TX_UDP[512..767]<br/>BUF_A/B[0..319] 为重构遗留"]
+
             subgraph LAYERS["协议栈层 (ap_ctrl_none, 事件驱动FSM)"]
-                MAC_RX["MAC RX<br/>GMII→buffer 1B/pass"]
+                MAC_RX["MAC RX<br/>GMII→frame_fifo 1B/pass"]
                 MAC_TX["MAC TX<br/>buffer→GMII 1B/pass"]
                 ARP["ARP L1:8(LRU)+L2:256(BRAM)"]
                 IP["IP checksum + 分发"]
@@ -66,7 +67,6 @@ graph TB
                 STATS["stats_report → msg_stream"]
             end
 
-            FIFO["4-FIFO 条件延迟<br/>(MAC TX忙时存帧)"]
             QUEUE["tcp_send_bufs BRAM<br/>echo 队列<br/>tcp_maintenance 刷新"]
         end
 
@@ -136,38 +136,44 @@ graph TB
     style UART fill:#fce4ec,stroke:#880e4f
     style PINS fill:#f5f5f5,stroke:#616161
     style BUF fill:#ffeb3b,stroke:#f57f17
-    style FIFO fill:#ff9800,stroke:#e65100
+    style FIFOBUF fill:#c8e6c9,stroke:#1b5e20
     style QUEUE fill:#ff9800,stroke:#e65100
 ```
 
-## 当前 buffer 布局
+## 当前 buffer 布局 (2026-08-23, RX stream 化重构后)
 
 ```
-buffer[512] BRAM 布局:
-  0                          255  320                    511
-  ├────────────────────────────┤   ├──────────────────────┤
-  │     RX 区域 (MAC RX 写)     │   │   TX 区域 (MAC TX 读) │
-  │  IP头[0..4] TCP头[5..9]   │   │   TX_UDP_BASE=320    │
-  │  载荷[10..143]             │   │   echo 帧写到这里     │
-  │  最大 256 words = 1024B   │   │   192 words = 768B   │
-  └────────────────────────────┘   └──────────────────────┘
-                  256..319: TX_SCRATCH (ARP/ICMP)
+RX 通路 (hls::stream 模式, UG1399 官方模式):
+  MAC RX → frame_fifo (hls::stream<uint32_t>, 512深, DUT 内部)
+         → frame_done 当拍 pop 到 frame_buf[400] (私有暂存, 单拍写后读)
+         → 各层 (ip/tcp/udp/icmp/arp/dhcp) 从 frame_buf 0 基偏移解析
+           (IP头@0, TCP/UDP/ICMP@5, ARP@0, DHCP@7)
+
+buffer[768] BRAM = TX 专用 (RX 已不再写它):
+  0..159   BUF_A      (双缓冲重构遗留, 未用)
+  160..319 BUF_B      (双缓冲重构遗留, 未用)
+  320..383 TX_SCRATCH (ARP/ICMP 回复帧)
+  384..511 DHCP 帧区
+  512..767 TX_UDP     (echo 帧写到这里; TX_UDP_BASE=512, 需 ap_uint<10> 地址)
 ```
 
 ## 数据流路径
 
 ```
-RX: PC → PHY → RGMII → IDELAY → IDDR → RX_FIFO → AXI-Stream → IP1(MAC_RX→buffer)
-TX: IP1(buffer→MAC_TX) → AXI-Stream → TX_FIFO → ODDR → RGMII → PHY → PC
+RX: PC → PHY → RGMII → IDELAY → IDDR → RX_FIFO(4096×9/3900) → AXI-Stream
+    → IP1(MAC_RX→frame_fifo→frame_buf→各层解析)
+TX: IP1(buffer[TX区]→MAC_TX) → AXI-Stream → TX_FIFO → ODDR → RGMII → PHY → PC
 UART: IP1(msg_stream) → IP2(uart_console) → TX_AND → CH340 → PC
 Probe: NET_STATS ← RX/TX 计数 + 帧捕获 → TX_AND → CH340 → PC
 ```
 
-## 已知问题
+## 已知问题 / 状态 (2026-08-23)
 
 | 问题 | 状态 |
 |------|------|
-| buffer[39] byte 2 多段竞态 (offset 1726) | 🔧 4-FIFO 条件延迟缓解 (HLS调度依赖) |
-| 4096B+ FIFO 容量不足 | 🔧 4条目限制, 需扩 FIFO + payload 保存 |
-| msg_stream CDC FIFO 未做 | ⬜ UART ?stat 无输出 |
-| ILA 探针插入 | ⬜ HLS 网表名不匹配, 需 Vivado GUI |
+| ~~buffer[39] byte 2 多段竞态 (offset 1726)~~ | ✅ 已破案 — 真根因 = wrapper RX FIFO 溢出 (2048/1900 顶不住 4段背靠背), 非 DUT 竞态; 见 RX_FIFO_OVERFLOW_ANALYSIS.md |
+| RX FIFO 容量不足 (2000B=4段顶满 2048) | ✅ 已修 2048→4096 / 阈值 1900→3900 (治标, 约容 ≤6 段; 治本 = 提升 DUT 排空速率, 后续可选优化) |
+| 板级回归 | ✅ py_net_test 7/7 PASS (ping/UDP64/UDP512/TCP25/TCP1608/TCP2000×3) |
+| ILA 探针链 | ✅ 已建成 (wrapper_1g_ila.v + vivado_ila_prj + ila_capture.bat + ila_analyze2.py), 2000B 破案主力 |
+| msg_stream CDC FIFO | ✅ ?stat/?net 均可用 (板级验证) |
+| TCP 健壮性 (重传/RST/乱序) | ⬜ 基本 echo 已验证; 丢包场景路径未覆盖 (见 MIGRATION_K7325T.md §3) |

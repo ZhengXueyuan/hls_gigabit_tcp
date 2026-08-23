@@ -1,8 +1,14 @@
 # udp_echo HLS — 协议架构设计与工程文档
 
-> **2026-08-18 移植状态**: 本目录是 ECO 板 (Kintex-7 XC7K325T) 的移植副本, 原始工程
-> (Artix-7 Perf-V) 在 D:\repo\perfv\udp_hls。协议栈源码架构不变, 本节及以下各节描述
-> HLS 协议栈本身; 移植后的板卡/wrapper/调试结论见 MIGRATION_K7325T.md 与 PORT_NOTES.md。
+> **2026-08-23 最终状态**: ECO 板 (Kintex-7 XC7K325T) 移植副本**已全链打通并通过压测**:
+> py_net_test **7/7 全 PASS** (ping / UDP 64B / UDP 512B / TCP 25B / TCP 1608B / **TCP 2000B×3**)。
+> 原始工程 (Artix-7 Perf-V) 在 D:\repo\perfv\udp_hls。
+> **RX 数据通路已于 2026-08-23 重构为 hls::stream 模式** (UG1399 官方模式): MAC RX 把帧字
+> 推入 `frame_fifo` (hls::stream, 512深), frame_done 当拍暂存到私有 `frame_buf[400]`,
+> 各层从 frame_buf 0 基偏移解析; 共享 `buffer[768]` 现为 **TX 专用**。
+> 本文 §3.2/§5/§6.1 已相应更新; 其余各节描述协议栈本身仍有效。
+> **2000B 第4段错位破案**: 根因 = wrapper `rx_fifo` 溢出 (非 HLS 竞态), 修复 2048→4096/3900,
+> 见 RX_FIFO_OVERFLOW_ANALYSIS.md; 板级结论见 MIGRATION_K7325T.md 与 PORT_NOTES.md。
 
 ## 1. 项目概述
 
@@ -83,7 +89,7 @@ HLS 只需 `add_files src/udp_echo.cpp` 即可编译全部代码。
 │  │  • EtherType dispatch: 0x0800→IP, 0x0806→ARP ✅       │    │
 │  │  • VLAN tag (802.1Q + 802.1ad QinQ) ✅                │    │
 │  │  • CRC32 compute (TX) ✅                               │    │
-│  │  • Payload → shared buffer                            │    │
+│  │  • Payload → frame_fifo (hls::stream) → frame_buf     │    │
 │  │  接口: hls::stream<gmii_byte_t> / mac_rx_t / mac_tx_req_t │
 │  └───────────────────────┬─────────────────────────────┘    │
 │                          │  AXI-Stream (data + last flag)    │
@@ -97,14 +103,16 @@ HLS 只需 `add_files src/udp_echo.cpp` 即可编译全部代码。
 ### 3.2 层间数据流
 
 ```
-RX: AXI-Stream<gmii_byte_t> → layer_mac → mac_rx_t
+RX: AXI-Stream<gmii_byte_t> → layer_mac → frame_fifo → frame_buf + mac_rx_t
                     ├── ethertype=0x0806 → layer_arp → tx_req (ARP Reply)
                     └── ethertype=0x0800 → layer_ip → ip_rx_t
                            ├── protocol=1  → layer_icmp → tx_req (Echo Reply)
                            ├── protocol=2  → layer_igmp → tx_req (Report)
-                           └── protocol=17 → layer_udp → buffer (echo)
+                           ├── protocol=6  → layer_tcp  → tx_req (TCP echo, port 7)
+                           └── protocol=17 → layer_udp  → tx_req (echo, port 8080)
 
-TX: tx_req (from ARP/ICMP/IGMP/UDP) → layer_mac → AXI-Stream<gmii_byte_t>
+TX: tx_req (from ARP/ICMP/IGMP/UDP/TCP) → layer_mac ← buffer[768] (TX 专用区)
+    → AXI-Stream<gmii_byte_t>
 ```
 
 ### 3.3 核心接口类型 (eth_types.h)
@@ -198,19 +206,26 @@ assign tx_ready = 1'b1;  // no backpressure
 
 ---
 
-## 5. 共享 Buffer 布局
+## 5. Buffer 布局 (2026-08-23, RX stream 化重构后)
 
 ```
-Buffer[512] = uint32_t array (512 × 32-bit = 2048 bytes)
+RX 通路 (hls::stream, 按 UG1399 "绝不在并发生产者/消费者间共享裸数组" 重构):
+  MAC RX → frame_fifo (hls::stream<uint32_t>, 512深, DUT 内部 static)
+         → frame_done 当拍 pop nwords 字到 frame_buf[400] (私有暂存)
+         → 各层 (ip/tcp/udp/icmp/arp/dhcp) 从 frame_buf 0 基偏移解析
+           (IP头@0, TCP/UDP/ICMP@5, ARP@0, DHCP@7)
 
-  0 ─────────────────────────── 255: RX area (incoming frame payload)
-256 ─────────────────────────── 383: TX scratch (ARP/ICMP/IGMP reply frames)
-384 ─────────────────────────── 511: TX UDP (IP+UDP headers + payload)
-    384..390: 7 words IP+UDP header
-    391..395: 5 words default payload ("HELLO       PERFXLAB")
+buffer[768] = uint32_t array (768 × 32-bit = 3072 bytes), 现 TX 专用:
+  0   ─── 159:  BUF_A      (双缓冲重构遗留, RX 已不再使用)
+  160 ─── 319:  BUF_B      (双缓冲重构遗留, RX 已不再使用)
+  320 ─── 383:  TX_SCRATCH (ARP/ICMP/IGMP reply frames)
+  384 ─── 511:  DHCP 帧区
+  512 ─── 767:  TX_UDP     (IP+UDP headers + payload; TX_UDP_BASE=512)
 ```
 
 Buffer + ARP 表均通过 `#pragma HLS RESOURCE core=RAM_2P_BRAM` 推断为双端口 BRAM。
+(注: 重构前旧布局为 buffer[512] = RX[0..255]/TX_SCRATCH[256..319]/TX_UDP[320..511],
+历史上曾用双缓冲 BUF_A/B; 均以本文上面当前布局为准。)
 
 ---
 
@@ -225,7 +240,8 @@ Buffer + ARP 表均通过 `#pragma HLS RESOURCE core=RAM_2P_BRAM` 推断为双�
   - 若 `eth_acc == 0x8100` 或 `0x88A8`: 跳转到 VLAN 状态, 跳过 2 字节 TCI, 重新读取 EtherType
   - 支持 QinQ 双层 tag (最多 2 层)
 - 帧结束由 stream 的 `last` 标志检测 (替代 dv 下降沿逻辑)
-- Payload 写入 Buffer[RX_BUFFER_BASE..]
+- **Payload 推入 `frame_fifo` (hls::stream)**, frame_done 当拍由顶层暂存到 `frame_buf[400]`
+  (2026-08-23 重构; 此前为直接写共享 Buffer RX 区)
 
 **TX FSM**: `IDLE → SEND55(8B) → SENDMAC(14B) → SENDDATA → SENDCRC(4B)`
 
@@ -245,7 +261,7 @@ Buffer + ARP 表均通过 `#pragma HLS RESOURCE core=RAM_2P_BRAM` 推断为双�
 
 ### 6.3 layer_ip.cpp — IP 层
 
-- 从 Buffer 读取 20 字节 IP header
+- 从 frame_buf 读取 20 字节 IP header (0 基偏移; 重构前为共享 Buffer RX 区)
 - 校验 version=4, IHL=5, header checksum
 - 分发: `protocol == 1`→ICMP, `2`→IGMP, `17`→UDP
 - 仅接受 `dst_ip == board_ip` 或广播 IP
@@ -270,9 +286,9 @@ Buffer + ARP 表均通过 `#pragma HLS RESOURCE core=RAM_2P_BRAM` 推断为双�
 
 ### 6.6 layer_udp.cpp — UDP 层
 
-- RX: 端口过滤 (仅 8080), 提取 payload
+- RX: 端口过滤 (仅 8080), 提取 payload (从 frame_buf 0 基偏移)
 - TX: 每 256 周期构建 IP+UDP header + default payload → 发起 TX 请求
-- Echo: 收到数据后 payload 从 RX buffer 复制到 TX buffer
+- Echo: 收到数据后 payload 从 frame_buf 复制到 TX buffer (buffer[768] 的 TX_UDP 区)
 
 ---
 
@@ -303,6 +319,20 @@ Buffer + ARP 表均通过 `#pragma HLS RESOURCE core=RAM_2P_BRAM` 推断为双�
 | wrapper rx_last_in 极性反 | IP 永不 complete 帧 | dv 上升沿被误当帧尾 | `rx_dv_d2 && !rx_dv_d1` (下降沿) 并 push rx_d2 |
 | demo 克隆生成器 FCS 错 (双重) | **所有 demo 克隆实验的帧被网卡当 FCS 错静默丢弃** (pktmon 零包) | ① eth_crc32 用 unreflected MSB-first CRC (线上 21 27 d6 68) ② 修复后又用 MSB-first 字节序 (线上 63 F9 A3 CA) — 本板 PHY/PC 链只接受 LSB-first | reflected CRC-32 (0xEDB88320) + 按 fcs[7:0],[15:8],[23:16],[31:24] 发出 (线上 CA A3 F9 63 = demo 帧字节)。板级验证 pk21 = 25 帧 ✓ |
 | ICMP 回复校验和错 | ping 帧到达 PC (pktmon 可见) 但 Windows 100% 超时 | `buffer[tx_base] &= 0xFFFF00FF` 只清零校验和字段高字节, 请求校验和低字节 (0xD4) 残留污染求和 → 线上 4600 (应 46D4) | `&= 0xFFFF0000` (清全部 16 位); TB 加 ICMP 回复校验和检查。板级验证 ping 4/4 0ms ✓ |
+
+### ECO 板 2000B 攻坚期修复 (2026-08-22~23, 全链打通)
+
+| Bug | 现象 | 根因 | 修复 |
+|-----|------|------|------|
+| 地址字段位宽不足 | UDP 8080 / TCP 7 全挂 (启用双缓冲后回归) | `ap_uint<9>` 地址字段截断 `TX_UDP_BASE=512`→0 | 改 `ap_uint<10>` (6 处) |
+| payload 字索引溢出 | TCP 回显混入 IP 头 | `uint8_t wi` 在 BUF_B 区 (base 160) 溢出 256→0 | 改 `uint16_t wi` |
+| xsim TB 卡死 (仿真侧) | DUT 收 2 字节后子 FSM 全死锁 | TB 漏接 DUT `reset_n` 软复位端口 (与 `ap_rst_n` 是两个独立输入) → phi-mux X | TB 实例化补 `.reset_n(rst_n)` |
+| **TCP 2000B 第4段错位** | 1608B PASS / 2000B 第4段 (~偏移1739) 非确定乱序 | **wrapper 层 `rx_fifo` 溢出** (2048深/1900门限; DUT 排空 ~1字节/20周期 顶不住 4 段背靠背 ~2392B) — **非 HLS 协议栈竞态** (xsim 直喂 DUT 2000B 逐字节全对; 板级 ILA 实锤 rx_occ 撞门限 + stride-21 子采样) | `rx_fifo` 2048→4096, 阈值 1900→3900, 指针 11→12bit。py_net_test **7/7 PASS**。治标 (≤6 段); 治本 = 提升 DUT 排空速率 (后续可选)。详见 RX_FIFO_OVERFLOW_ANALYSIS.md |
+
+> **教训 (2000B 攻坚)**: ① 连续多架构同点失败时, 应早怀疑假设本身 — 三种 DUT 内部 RX
+> 架构 (双缓冲/去FIFO/stream) 全在同点失败, 病根一直在 wrapper FIFO。② csim / DUT-only
+> xsim 都绕过 wrapper FIFO, 物理速率差复现不了, 板级 ILA 是金标准。③ 若必须丢帧,
+> 应在帧边界丢整帧, 别丢半帧 (丢半帧会错位污染解析)。
 
 > **教训 (FCS/校验和铁律)**: 网卡静默丢弃 (pktmon 零包) 的三大原因: runt <64B、FCS 错、字节错位。
 > FCS 的"标准"有实现歧义 (多项式 AND 线上字节序) — "自己验证自己"的闭环 (生成器 CRC 与

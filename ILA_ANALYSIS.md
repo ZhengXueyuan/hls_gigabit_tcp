@@ -4,6 +4,15 @@
 > 位流: wrapper_1g.bit (含 ILA u_ila_buf39)
 > ILA 探针: buffer_r_U Port 0 (read) + Port 1 (write), 触发条件 address0==39
 
+> **⚠ 结论更正 (2026-08-23): 本调查路线 (buffer[39] BRAM 读写竞态假设) 已被证伪,**
+> **本文档保留作过程记录, 下方"待填"项不再执行。**
+> 后续板级 ILA 实锤: 2000B 第4段错位的最终根因 = **wrapper 层 `rx_fifo` 溢出**
+> (2048深/1900门限, 4 段背靠背 ~2392B 顶满; DUT 排空 ~1字节/20周期), 与 buffer BRAM /
+> written 阵列 / tcp_send_bufs 均无关。**修复: rx_fifo 2048→4096 / 门限 1900→3900**,
+> 板上 py_net_test 7/7 PASS。权威分析见 [RX_FIFO_OVERFLOW_ANALYSIS.md](RX_FIFO_OVERFLOW_ANALYSIS.md)。
+> (实际破案的 ILA 工程 = `wrapper_1g_ila.v` + `vivado_ila_prj/`, 探针为 rx_occ/rx_wptr 等
+> FIFO 信号 + tcp_send_bufs 端口, 捕获 cap_a/b/c.csv, 非本文档的 buffer[39] 单地址触发。)
+
 ## 1. ILA 探针配置
 
 | 探针 | 位宽 | 信号 | 说明 |

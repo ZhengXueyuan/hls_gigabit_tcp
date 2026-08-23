@@ -1512,3 +1512,37 @@ wrapper_1g_ila.v 的 rx_fifo: 2048→4096, 指针 11→12bit, 门限 1900→3900
 - **结论**: 2000B 第4段竞态 = wrapper RX FIFO 溢出 (wire 线速 vs DUT ~1/20 排空),
   与 tcp_send_bufs / RX 重构 / BRAM written 阵列全部无关。4096 FIFO 治标 (≤6段);
   治本需 HLS 侧让 mac_rx 排空跟上线速 (或继续加大 FIFO 覆盖目标突发长度)。
+
+---
+
+## ★ 最终状态小结 (2026-08-23, 工程收官)
+
+**全链打通并通过压测**: `py_net_test.py` (anaconda python) **7/7 全 PASS** =
+ping / UDP 64B / UDP 512B / TCP 25B / TCP 1608B / **TCP 2000B×3**。
+板上可用: UART console (`?mac ?ip ?stat ?net`)、ARP、ICMP ping、UDP 8080 echo、
+TCP 端口 7 echo。生产位流 = `vivado_prj/udp_dual_phy1g2.runs/impl_1/wrapper_1g.bit`
+(rx_fifo 4096/3900)。
+
+**2000B 最终结论**: 根因 = wrapper `rx_fifo` 溢出 (2048深/1900门限, 非 HLS 协议栈竞态),
+修复 2048→4096 / 1900→3900 / 指针 11→12bit。权威分析 = RX_FIFO_OVERFLOW_ANALYSIS.md。
+顺带修的真 bug: `ap_uint<9>`→`ap_uint<10>` (TX_UDP_BASE=512 截断)、`uint8_t wi`→`uint16_t`
+(payload 索引溢出)、xsim TB 补接 `reset_n`。RX 通路已按 UG1399 重构为 hls::stream
+(frame_fifo→frame_buf; 共享 buffer[768] 为 TX 专用)。
+遗留可选优化: 提升 DUT 排空速率 (治本) / DDR3 大缓冲 (见 DDR3_INTEGRATION_PLAN.md)。
+
+### 文档清理记录 (2026-08-23, 纯文档工作, 未碰代码/工具链)
+
+| 文件 | 改动 |
+|------|------|
+| `README.md` | 状态段更新为 2026-08-23 全通+2000B已修复; 架构图 RX FIFO 改 4096×9/3900 + RX stream 化说明; 资源表标注 36,200 LUT 为重构前 (2026-08-18) 记录值; 已知问题表 #8 改已修、新增 #9 (rx_fifo 破案); 构建段补 _run_*.bat/ILA/xsim 链; 测试脚本表加 py_net_test.py; 项目结构补 tb_*.v/py/wrapper_1g_ila.v |
+| `CLAUDE.md` (工程) | "当前状态"更新为 2026-08-23 最终态 (7/7 PASS + 2000B 根因/修复 + stream 重构 + 3 个真 bug); 工程结构表补 tb/py/ILA 文件; 构建段补便捷 bat; 教训表加 rx_fifo 容量定容/reset_n 悬空/窄类型索引 3 条 |
+| `TOPOLOGY.md` | mermaid 图: RX FIFO 2048→4096/3900, IP1 内部改 frame_fifo+frame_buf+buffer[768] TX专用 (去掉 4-FIFO 节点); buffer 布局/数据流/已知问题段全部更新为最终态; NIC comp 102→117 (与 README/验证指南一致) |
+| `HANDSHAKE_PROPOSAL.md` | 文首加"已被取代"说明: 方案被 hls::stream 重构取代, 且真根因是 wrapper rx_fifo 溢出, 指向 RX_FIFO_OVERFLOW_ANALYSIS.md |
+| `ILA_ANALYSIS.md` | 文首加"结论更正": buffer[39] 调查路线已证伪, 最终根因 rx_fifo 溢出, 指向权威分析 |
+| `BRAM_WRITTEN_RACE_ANALYSIS.md` | 文末加 §8 指针: written 非根因结论仍成立, 最终根因 = wrapper rx_fifo (§5 方向 3 即正解) |
+| `ARCHITECTURE.md` | 头部状态更新为 2026-08-23 全通; §3.1/3.2 数据流改 frame_fifo/frame_buf; §5 buffer 布局改 768 字 TX 专用新分区; §6.1 MAC RX / §6.3 IP / §6.6 UDP 的 RX 读取描述更新为 frame_buf; §7 新增"2000B 攻坚期修复"表 (4 行) + 攻坚教训 |
+| `MIGRATION_K7325T.md` | 头部状态改"移植完成 (2026-08-23)"; §3 已知 bug 清单加批注 (#3 症状已消除, 其余健壮性项未逐项复核); §2.1 第7条更新为 RX stream 化后的现状 |
+| `网络验证指南.md` | 头部更新为全通+2000B 破案; 验证顺序 1-4 全 ✅, 加 py_net_test 一键回归; 工程文件速查补 ILA/xsim 链; 已知遗留更新 (去掉已解决的 CDC/?stat, 加治标/治本说明) |
+| `DDR3_INTEGRATION_PLAN.md` | 文首补记: 2000B 已修不阻塞 DDR3, DDR3 为后续可选优化 |
+| `RX_FIFO_OVERFLOW_ANALYSIS.md` | 未动 (已是最终权威分析) |
+| `PORT_NOTES.md` | 本小结 + 本记录 (append-only) |

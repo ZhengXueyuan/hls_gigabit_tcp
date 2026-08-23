@@ -1,5 +1,22 @@
 # 双缓冲 + 读控制器方案 — 完整推演
 
+> **⚠ 本文档已被取代 (2026-08-23), 保留作过程记录, 别按此施工。**
+>
+> 1. **方案层面**: 本"双缓冲 + 读控制器"提案未实施; RX 通路后来按 UG1399 官方模式
+>    重构为 hls::stream (MAC RX → `frame_fifo` 512深 → frame_done 当拍暂存
+>    `frame_buf[400]` → 各层 0 基偏移解析; 共享 `buffer[768]` 变为 TX 专用)。
+> 2. **根因层面 (更重要)**: 2000B 第4段错位的**最终根因不是 DUT 内部 buffer 竞态**,
+>    而是 **wrapper 层 `rx_fifo` 溢出** (2048深/1900门限 顶不住 4 段背靠背 ~2392B;
+>    DUT 排空 ~1字节/20周期)。三种 DUT 内部 RX 架构 (双缓冲/去FIFO/stream) 全在同点
+>    失败 — 病根一直在 wrapper FIFO, 从未被 DUT 侧改动触及。
+>    **修复**: `rx_fifo` 2048→4096 / 门限 1900→3900, 板上 py_net_test 7/7 PASS。
+>    权威分析见 [RX_FIFO_OVERFLOW_ANALYSIS.md](RX_FIFO_OVERFLOW_ANALYSIS.md)。
+>
+> 教训: 连续多架构同点失败时, 应早怀疑假设本身 (病根可能不在 DUT 内, 而在 wrapper
+> 的速率差缓冲)。csim / DUT-only xsim 都绕过 wrapper FIFO, 只有板级 ILA 能实锤。
+
+---
+
 ## 核心架构
 
 ```

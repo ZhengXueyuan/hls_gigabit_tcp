@@ -1,10 +1,13 @@
 # 移植指南：udp_hls 网络协议栈 → Kintex-7 325T 新板
 
-> 状态: 2026-08-16 启动, 2026-08-18 更新。旧板 (Perf-V xc7a35tftg256-1) 以太网 PHY↔FPGA
+> 状态: 2026-08-16 启动, **2026-08-23 完成**。旧板 (Perf-V xc7a35tftg256-1) 以太网 PHY↔FPGA
 > 物理通路经对照实验判定损坏, 已停止在该板上的网络调试, 移植到 ECO 板
 > (XC7K325T-2FFG676C, 副本 D:\repo\ECO\udp_hls_eco)。
-> **当前进度**: UART console + RX 通路板级验证 ✅; 协议栈 4 个 bug 已修并重综合 ✅;
-> TX 零帧问题已破案 (FCS 位序错), 修复版板级复核中 — 细节全部在 PORT_NOTES.md。
+> **最终状态 (2026-08-23)**: ✅ **移植完成, 全链打通并通过压测** — py_net_test **7/7 全 PASS**
+> (ping / UDP 64B / UDP 512B / TCP 25B / TCP 1608B / **TCP 2000B×3**); UART console
+> (`?mac ?ip ?stat ?net`)、ARP、ICMP、UDP 8080 echo、TCP 7 echo 全部板级可用。
+> 收官破案: 2000B 第4段错位 = **wrapper `rx_fifo` 溢出** (2048/1900 → 4096/3900 修复),
+> 非 HLS 竞态 — 权威分析见 RX_FIFO_OVERFLOW_ANALYSIS.md。
 > 本文档汇总工程盘点、已验证结论、移植操作步骤; 板级施工日志以 PORT_NOTES.md 为准。
 
 ---
@@ -59,7 +62,9 @@ IP2: uart_console @ fpga_gclk (50MHz)
 5. **括号错位排查**: 独立 clang 编译通过 ≠ HLS 通过; 用 brace-depth 脚本逐行查。
    (曾发生 TX 段整个嵌套进 RX else 分支 — 缺一个 `}`, csim 报错但独立编译不报。)
 6. 声明但未连接的端口会导致 DONE=LOW。
-7. 层间通信用 struct 引用 (非 stream), 避免 FIFO 开销; 共享 `static buffer[512]` → BRAM。
+7. 层间通信用 struct 引用 (非 stream), 避免 FIFO 开销; TX 走共享 `static buffer[768]` → BRAM。
+   (2026-08-23 更新: RX 已按 UG1399 重构为 hls::stream — MAC RX→`frame_fifo`→`frame_buf[400]`,
+   不再在并发生产者/消费者间共享裸 RX 数组; 共享 buffer 现为 TX 专用。)
 
 ### 2.2 板级调试方法论 (按优先级)
 
@@ -90,6 +95,11 @@ IP2: uart_console @ fpga_gclk (50MHz)
 ---
 
 ## 3. 已知未修 bug (移植后第一个修复清单)
+
+> **2026-08-23 更新**: 基本功能已全部板级验证通过 (ping/UDP/TCP echo, 2000B×3 压测) —
+> 下表 #3 (ICMP dst_mac) 的"ping 必死"症状已消除 (ping 4/4 通过为实测事实)。
+> 其余条目属 TCP 健壮性/边界场景 (重传/RST/乱序/选项), **未逐项复核**, 基本 echo
+> 路径不经过它们; 丢包加压或生产化前需回到此清单。基本 echo 正确性不依赖这些修复。
 
 来自 TCP 代码审查, **全部在 `udp_hls/src/`**:
 

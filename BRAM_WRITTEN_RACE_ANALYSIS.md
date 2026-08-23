@@ -121,3 +121,19 @@ mkdir -p bram_sim
 "C:/AMDDesignTools/2025.2/Vivado/bin/xelab.bat" tb_written_race3 -L xil_defaultlib
 "C:/AMDDesignTools/2025.2/Vivado/bin/xsim.bat" tb_written_race3 -R
 ```
+
+---
+
+## 8. 最终根因指针 (2026-08-23 补记)
+
+本文结论 ("`written` 阵列 / BRAM READ_FIRST 不是根因") **仍然正确**, 且被后续调查最终证实。
+§5 的"待验证方向 3 (wrapper 层 RX FIFO 桥)" 事后看正是正解方向:
+
+- **最终根因 = wrapper 层 `rx_fifo` 溢出** (原 2048 深 / 阈值 1900): HLS DUT 排空
+  ~1字节/20周期, 远低于 1Gbps 线速; 2000B = 4 段背靠背 ~2392B 顶满 FIFO → 丢第4段
+  中段字节 + 丢 last 标志 → 融合下一帧 → 回显错位。板级 ILA 实锤 (rx_occ 撞 1900 门限
+  + stride-21 子采样垃圾字节)。
+- **DUT (HLS 协议栈) 逻辑无错**: xsim 直接喂 DUT 2000B 逐字节全对。
+- **修复**: `rx_fifo` 2048→4096 / 阈值 1900→3900 / 指针 11→12bit → py_net_test 7/7 PASS。
+
+完整调查链见 [RX_FIFO_OVERFLOW_ANALYSIS.md](RX_FIFO_OVERFLOW_ANALYSIS.md)。
