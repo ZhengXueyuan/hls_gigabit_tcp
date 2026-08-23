@@ -7,6 +7,13 @@ metadata:
   originSessionId: c9327a9f-9795-4727-9c2d-62d7406c8740
 ---
 
+> ⚠️ **原工程历史快照，勿与 ECO 副本混淆。**
+> 本文件描述的是**原始 perfv `udp_hls` 工程** (D:\repo\perfv, 器件 xc7a35tftg256-1, IP 192.168.0.x,
+> 共享 buffer[512] 旧架构) 在某一时刻的状态, 仅作历史参考。
+> **ECO 板 (XC7K325T) 当前工程以 `udp_hls_eco/` 下的 PORT_NOTES.md / CLAUDE.md /
+> RX_FIFO_OVERFLOW_ANALYSIS.md 为准** — 那些才反映 2026-08-23 后的真实状态
+> (RX 已 hls::stream 化, buffer[768] TX 专用, rx_fifo 4096/3900, ping/UDP/TCP-2000B 全通)。
+
 # udp_hls — FPGA 网络协议栈 (HLS)
 
 ## 概述
